@@ -445,7 +445,7 @@ def main() -> None:
         sys.exit(1)
     logger.debug("Downloading to " + os.getcwd() + "...")
 
-    download_url(client, typing.cast(SCDLArgs, python_args))
+    download_url(client, typing.cast("SCDLArgs", python_args))
 
     if arguments["--remove"]:
         remove_files()
@@ -904,7 +904,7 @@ def download_original_file(
     header = r.headers.get("content-disposition")
     params = utils.parse_header(header)
     if "filename" in params:
-        filename = urllib.parse.unquote(params["filename"][-1], encoding="utf-8")
+        filename = urllib.parse.unquote(params["filename"], encoding="utf-8")
     else:
         raise MissingFilenameError(header)
 

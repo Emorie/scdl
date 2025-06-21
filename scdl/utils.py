@@ -76,8 +76,17 @@ def size_in_bytes(insize: str) -> int:
 
 
 def parse_header(content_disposition: Optional[str]) -> Dict[str, str]:
+    """Parse a Content-Disposition style header into a dictionary."""
+
     if not content_disposition:
         return {}
+
     message = email.message.Message()
     message["content-type"] = content_disposition
-    return dict(message.get_params({}))
+
+    params = message.get_params()
+    if not params:
+        return {}
+
+    # Skip the first element which contains the main value (e.g. "attachment")
+    return dict(params[1:])
