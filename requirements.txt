@@ -1,0 +1,2 @@
+scdl>=3.6.0           # SoundCloud downloader CLI
+# ffmpeg is required at runtime; install via your OS package manager
