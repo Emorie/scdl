@@ -90,6 +90,20 @@ def test_flac(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not os.getenv("AUTH_TOKEN"), reason="No auth token specified")
+def test_best_quality(tmp_path: Path) -> None:
+    os.chdir(tmp_path)
+    r = call_scdl_with_auth(
+        "-l",
+        "https://soundcloud.com/violinbutterflynet/original",
+        "--name-format",
+        "track",
+        "--best-quality",
+    )
+    assert r.returncode == 0
+    assert_track(tmp_path, "track.flac", "copy", "saves", None)
+
+
+@pytest.mark.skipif(not os.getenv("AUTH_TOKEN"), reason="No auth token specified")
 def test_m4a(tmp_path: Path) -> None:
     os.chdir(tmp_path)
     r = call_scdl_with_auth(

@@ -9,7 +9,7 @@ Usage:
     [--original-name][--original-metadata][--no-original][--only-original]
     [--name-format <format>][--strict-playlist][--playlist-name-format <format>]
     [--client-id <id>][--auth-token <token>][--overwrite][--no-playlist][--opus]
-    [--add-description]
+    [--add-description][--best-quality]
 
     scdl -h | --help
     scdl --version
@@ -72,6 +72,9 @@ Options:
     --no-playlist                   Skip downloading playlists
     --add-description               Adds the description to a separate txt file
     --opus                          Prefer downloading opus streams over mp3 streams
+    --best-quality                  Try to download lossless audio and convert to
+                                    FLAC when possible; fall back to the best
+                                    available quality otherwise
 """
 
 import atexit
@@ -180,6 +183,7 @@ class SCDLArgs(TypedDict):
     only_original: bool
     onlymp3: bool
     opus: bool
+    best_quality: bool
     original_art: bool
     original_metadata: bool
     original_name: bool
@@ -432,6 +436,10 @@ def main() -> None:
     for key, value in arguments.items():
         key = key.strip("-").replace("-", "_")
         python_args[key] = value
+
+    if python_args.get("best_quality"):
+        python_args["flac"] = True
+        python_args["opus"] = True
 
     # change download path
     dl_path: str = arguments["--path"] or config["scdl"]["path"]

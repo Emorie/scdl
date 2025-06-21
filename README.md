@@ -91,6 +91,8 @@ scdl me -f
 --add-description               Adds the description to a seperate txt file (can be read by some players)
 --no-playlist                   Skip downloading playlists
 --opus                          Prefer downloading opus streams over mp3 streams
+--best-quality                  Try to download lossless audio first, converting to FLAC when
+                                available, and fall back to the next best quality
 ```
 
 
