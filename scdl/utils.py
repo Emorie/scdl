@@ -89,4 +89,9 @@ def parse_header(content_disposition: Optional[str]) -> Dict[str, str]:
         return {}
 
     # Skip the first element which contains the main value (e.g. "attachment")
-    return dict(params[1:])
+    parsed = {}
+    for k, v in params[1:]:
+        if isinstance(v, tuple):
+            v = v[0]
+        parsed[k] = v
+    return parsed
