@@ -11,3 +11,6 @@ __pycache__/
 .idea
 .python-version
 .DS_store
+# Ignore downloaded media and logs
+Music/SoundCloud/
+*.log
