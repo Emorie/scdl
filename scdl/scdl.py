@@ -9,7 +9,7 @@ Usage:
     [--original-name][--original-metadata][--no-original][--only-original]
     [--name-format <format>][--strict-playlist][--playlist-name-format <format>]
     [--client-id <id>][--auth-token <token>][--overwrite][--no-playlist][--opus]
-    [--add-description][--best-quality]
+    [--add-description][--best-quality][--list-qualities]
 
     scdl -h | --help
     scdl --version
@@ -75,6 +75,7 @@ Options:
     --best-quality                  Try to download lossless audio and convert to
                                     FLAC when possible; fall back to the best
                                     available quality otherwise
+    --list-qualities                List available stream qualities for a track
 """
 
 import atexit
@@ -184,6 +185,7 @@ class SCDLArgs(TypedDict):
     onlymp3: bool
     opus: bool
     best_quality: bool
+    list_qualities: bool
     original_art: bool
     original_metadata: bool
     original_name: bool
@@ -440,6 +442,8 @@ def main() -> None:
     if python_args.get("best_quality"):
         python_args["flac"] = True
         python_args["opus"] = True
+        python_args.setdefault("add_description", True)
+        python_args.setdefault("original_art", True)
 
     # change download path
     dl_path: str = arguments["--path"] or config["scdl"]["path"]
@@ -573,6 +577,9 @@ def download_url(client: SoundCloud, kwargs: SCDLArgs) -> None:
         sys.exit(1)
     elif isinstance(item, Track):
         logger.info("Found a track")
+        if kwargs.get("list_qualities"):
+            list_transcoding_presets(item)
+            return
         download_track(client, item, kwargs)
     elif isinstance(item, AlbumPlaylist):
         logger.info("Found a playlist")
@@ -900,6 +907,13 @@ def download_original_file(
         return None, False
 
     r = requests.get(url, stream=True)
+    content_type = r.headers.get("content-type", "?")
+    content_len = r.headers.get("content-length")
+    if content_len is not None:
+        size_mb = int(content_len) / 1_000_000
+        logger.info("Original format %s, %.1fMB", content_type, size_mb)
+    else:
+        logger.info("Original format %s", content_type)
     if r.status_code == 401:
         logger.info("The original file has no download left.")
         return None, False
@@ -1022,26 +1036,37 @@ def download_hls(
     to_stdout = is_downloading_to_stdout(kwargs)
 
     # ordered in terms of preference best -> worst
-    valid_presets = [("mp3", ".mp3")]
+    valid_presets: List[Tuple[str, str]] = [("mp3", ".mp3")]
 
     if not kwargs.get("onlymp3"):
         if kwargs.get("opus"):
             valid_presets = [("opus", ".opus"), *valid_presets]
         valid_presets = [("aac_256k", ".m4a"), ("aac", ".m4a"), *valid_presets]
+    if kwargs.get("flac"):
+        # Some transcodings advertise "flac" or "lossless" in the preset
+        valid_presets = [("flac", ".flac"), ("lossless", ".flac"), *valid_presets]
 
     transcoding = None
     ext = None
     for preset_name, preset_ext in valid_presets:
         for t in transcodings:
-            if t.preset.startswith(preset_name):
+            if t.preset.startswith(preset_name) or preset_name in t.format.mime_type:
                 transcoding = t
                 ext = preset_ext
+                break
         if transcoding:
             break
     else:
         raise SoundCloudException(
             "Could not find valid transcoding. Available transcodings: "
             f"{[t.preset for t in track.media.transcodings if t.format.protocol == 'hls']}",
+        )
+
+    if transcoding:
+        logger.info(
+            "Selected quality: %s (%s)",
+            transcoding.preset,
+            transcoding.quality,
         )
 
     filename = get_filename(track, kwargs, ext=ext, playlist_info=playlist_info)
@@ -1229,6 +1254,16 @@ def already_downloaded(
         logger.error("Exiting... (run again with -c to continue)")
         sys.exit(1)
     return False
+
+
+def list_transcoding_presets(track: Union[BasicTrack, Track]) -> None:
+    """Log available transcoding presets for a track."""
+    if not track.media.transcodings:
+        logger.info("No transcodings available")
+        return
+    logger.info("Available qualities:")
+    for t in track.media.transcodings:
+        logger.info("%s - %s (%s)", t.preset, t.format.mime_type, t.format.protocol)
 
 
 def in_download_archive(track: Union[BasicTrack, Track], kwargs: SCDLArgs) -> bool:
