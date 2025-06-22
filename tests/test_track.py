@@ -17,6 +17,7 @@ def test_original_download(tmp_path: Path) -> None:
         "track",
     )
     assert r.returncode == 0
+    assert "Original format" in r.stdout
     assert_track(tmp_path, "track.wav", "copy", "saves", None)
 
 
@@ -100,7 +101,35 @@ def test_best_quality(tmp_path: Path) -> None:
         "--best-quality",
     )
     assert r.returncode == 0
+    assert "Selected quality:" in r.stdout or "Original format" in r.stdout
     assert_track(tmp_path, "track.flac", "copy", "saves", None)
+
+
+@pytest.mark.skipif(not os.getenv("AUTH_TOKEN"), reason="No auth token specified")
+def test_list_qualities(tmp_path: Path) -> None:
+    os.chdir(tmp_path)
+    r = call_scdl_with_auth(
+        "-l",
+        "https://soundcloud.com/one-thousand-and-one/test-track",
+        "--list-qualities",
+    )
+    assert r.returncode == 0
+    assert "Available qualities" in r.stdout
+
+
+@pytest.mark.skipif(not os.getenv("AUTH_TOKEN"), reason="No auth token specified")
+def test_quality_logged(tmp_path: Path) -> None:
+    os.chdir(tmp_path)
+    r = call_scdl_with_auth(
+        "-l",
+        "https://soundcloud.com/one-thousand-and-one/test-track",
+        "--name-format",
+        "track",
+        "--onlymp3",
+    )
+    assert r.returncode == 0
+    assert "Selected quality:" in r.stdout
+    assert_track(tmp_path, "track.mp3")
 
 
 @pytest.mark.skipif(not os.getenv("AUTH_TOKEN"), reason="No auth token specified")
