@@ -63,7 +63,9 @@ scdl me -f
 --debug                         Set log level to DEBUG
 --error                         Set log level to ERROR
 --download-archive [file]       Keep track of track IDs in an archive file,
-                                and skip already-downloaded files
+                                and skip already-downloaded files.
+                                The archive is loaded once at startup for
+                                faster duplicate checks
 --extract-artist                Set artist tag from title instead of username
 --hide-progress                 Hide the wget progress bar
 --hidewarnings                  Hide Warnings. (use with precaution)
@@ -93,6 +95,7 @@ scdl me -f
 --opus                          Prefer downloading opus streams over mp3 streams
 --best-quality                  Try to download lossless audio first, converting to FLAC when
                                 available, and fall back to the next best quality
+--retries <retries>             Retry failed network requests up to <retries> times
 ```
 
 

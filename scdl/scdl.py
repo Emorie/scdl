@@ -9,7 +9,7 @@ Usage:
     [--original-name][--original-metadata][--no-original][--only-original]
     [--name-format <format>][--strict-playlist][--playlist-name-format <format>]
     [--client-id <id>][--auth-token <token>][--overwrite][--no-playlist][--opus]
-    [--add-description][--best-quality][--list-qualities]
+    [--add-description][--best-quality][--list-qualities][--retries <retries>]
 
     scdl -h | --help
     scdl --version
@@ -76,6 +76,7 @@ Options:
                                     FLAC when possible; fall back to the best
                                     available quality otherwise
     --list-qualities                List available stream qualities for a track
+    --retries <retries>             Retry failed network requests up to <retries> times
 """
 
 import atexit
@@ -120,6 +121,7 @@ import mutagen
 import requests
 from docopt import docopt
 from pathvalidate import sanitize_filename
+from requests.adapters import HTTPAdapter, Retry
 from soundcloud import (
     AlbumPlaylist,
     BasicAlbumPlaylist,
@@ -149,6 +151,17 @@ logger.addFilter(utils.ColorizeFilter())
 FFMPEG_PIPE_CHUNK_SIZE = 1024 * 1024  # 1 mb
 
 files_to_keep = []
+
+
+def setup_requests_session(retries: int) -> None:
+    """Configure global requests session with retry logic."""
+    session = requests.Session()
+    strategy = Retry(total=retries, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    requests.get = session.get  # type: ignore[attr-defined]
+    requests.post = session.post  # type: ignore[attr-defined]
 
 
 class SCDLArgs(TypedDict):
@@ -196,6 +209,7 @@ class SCDLArgs(TypedDict):
     playlist_offset: NotRequired[int]
     r: bool
     remove: bool
+    retries: int
     strict_playlist: bool
     sync: Optional[str]
     s: Optional[str]
@@ -331,6 +345,15 @@ def main() -> None:
     logger.info("Soundcloud Downloader")
     logger.debug(arguments)
 
+    try:
+        arguments["--retries"] = int(arguments["--retries"] or 3)
+        if arguments["--retries"] < 0:
+            raise ValueError
+    except Exception:
+        logger.error("--retries should be a non-negative integer")
+        sys.exit(1)
+    setup_requests_session(arguments["--retries"])
+
     client_id = arguments["--client-id"] or config["scdl"]["client_id"]
     token = arguments["--auth-token"] or config["scdl"]["auth_token"]
 
@@ -456,6 +479,13 @@ def main() -> None:
             logger.error(f"Invalid download path '{dl_path}' in {config_file}")
         sys.exit(1)
     logger.debug("Downloading to " + os.getcwd() + "...")
+
+    # Preload download archive for faster duplicate checks
+    if python_args.get("download_archive"):
+        download_archive_cache.clear()
+        download_archive_cache.update(
+            load_download_archive(python_args["download_archive"])
+        )
 
     download_url(client, typing.cast("SCDLArgs", python_args))
 
@@ -1266,11 +1296,31 @@ def list_transcoding_presets(track: Union[BasicTrack, Track]) -> None:
         logger.info("%s - %s (%s)", t.preset, t.format.mime_type, t.format.protocol)
 
 
+download_archive_cache: Set[str] = set()
+
+
+def load_download_archive(archive_filename: str) -> Set[str]:
+    """Load download archive IDs into a set."""
+    archive_file = pathlib.Path(archive_filename)
+    if not archive_file.exists():
+        return set()
+    try:
+        with get_filelock(archive_file), open(archive_file, encoding="utf-8") as file:
+            return {line.strip() for line in file if line.strip()}
+    except OSError as ioe:
+        logger.error("Error trying to read download archive...")
+        logger.error(ioe)
+        return set()
+
+
 def in_download_archive(track: Union[BasicTrack, Track], kwargs: SCDLArgs) -> bool:
-    """Returns True if a track_id exists in the download archive"""
+    """Return True if a track_id exists in the download archive"""
     archive_filename = kwargs.get("download_archive")
     if not archive_filename:
         return False
+
+    if download_archive_cache:
+        return str(track.id) in download_archive_cache
 
     try:
         with get_filelock(archive_filename), open(archive_filename, "a+", encoding="utf-8") as file:
@@ -1295,6 +1345,7 @@ def record_download_archive(track: Union[BasicTrack, Track], kwargs: SCDLArgs) -
     try:
         with get_filelock(archive_filename), open(archive_filename, "a", encoding="utf-8") as file:
             file.write(f"{track.id}\n")
+        download_archive_cache.add(str(track.id))
     except OSError as ioe:
         logger.error("Error trying to write to download archive...")
         logger.error(ioe)

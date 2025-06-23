@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-sync_sc.py – tiny wrapper around `scdl` that keeps your SoundCloud playlists
-mirrored locally.  Add/Remove playlist URLs in PLAYLISTS.  Point cron / Task
+sync_sc.py - tiny wrapper around `scdl` that keeps your SoundCloud playlists
+mirrored locally. Add or remove playlist URLs in PLAYLISTS and point cron / Task
 Scheduler at this file to automate.
 """
 
-import subprocess
 import pathlib
+import subprocess
 import sys
 
 # Folder to keep your downloads
@@ -17,7 +17,6 @@ ARCHIVE = BASE / "archive.txt"
 # \u270F\ufe0f  Add/Remove your playlist or like URLs here
 PLAYLISTS = [
     "https://soundcloud.com/yourname/sets/my-playlist",
-    # "https://soundcloud.com/someone/sets/another-one",
 ]
 
 BASE.mkdir(parents=True, exist_ok=True)
