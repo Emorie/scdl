@@ -1,7 +1,7 @@
 """scdl allows you to download music from Soundcloud
 
 Usage:
-    scdl (-l <track_url> | -s <search_query> | me) [-a | -f | -C | -t | -p | -r]
+    scdl (-l <track_url> | -s <search_query> | me [all]) [-a | -f | -C | -t | -p | -r]
     [-c | --force-metadata][-n <maxtracks>][-o <offset>][--hidewarnings][--debug | --error]
     [--path <path>][--addtofile][--addtimestamp][--onlymp3][--hide-progress][--min-size <size>]
     [--max-size <size>][--remove][--no-album-tag][--no-playlist-folder]
@@ -28,6 +28,8 @@ Options:
     -C                              Download all tracks commented on by a user
     -p                              Download all playlists of a user
     -r                              Download all reposts of user
+    all                            Download all likes with best-quality,
+                                    retries and archive defaults
     -c                              Continue if a downloaded file already exists
     --force-metadata                This will set metadata on already downloaded track
     -o [offset]                     Start downloading a playlist from the [offset]th track
@@ -160,8 +162,8 @@ def setup_requests_session(retries: int) -> None:
     adapter = HTTPAdapter(max_retries=strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    requests.get = session.get  # type: ignore[attr-defined]
-    requests.post = session.post  # type: ignore[attr-defined]
+    requests.get = session.get  # type: ignore[attr-defined,assignment]
+    requests.post = session.post  # type: ignore[attr-defined,assignment]
 
 
 class SCDLArgs(TypedDict):
@@ -198,6 +200,7 @@ class SCDLArgs(TypedDict):
     onlymp3: bool
     opus: bool
     best_quality: bool
+    all: bool
     list_qualities: bool
     original_art: bool
     original_metadata: bool
@@ -328,6 +331,13 @@ def main() -> None:
 
     # Parse arguments
     arguments = docopt(__doc__, version=__version__)
+
+    if arguments.get("all"):
+        arguments["-f"] = True
+        arguments["--best-quality"] = True
+        arguments["-c"] = True
+        arguments["--retries"] = arguments["--retries"] or "3"
+        arguments.setdefault("--download-archive", "archive.txt")
 
     if arguments["--debug"]:
         logger.level = logging.DEBUG
