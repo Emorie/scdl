@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -784,14 +785,17 @@ class QueueManager:
 
 
 queue_manager = QueueManager()
-app = FastAPI(title="SoundCloud Quality Downloader", version=APP_VERSION)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     ensure_directories()
     load_settings()
+    yield
+
+
+app = FastAPI(title="SoundCloud Quality Downloader", version=APP_VERSION, lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
@@ -824,7 +828,7 @@ async def get_settings() -> dict[str, Any]:
 @app.put("/api/settings")
 async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
     settings = load_settings()
-    data = update.dict(exclude_unset=True)
+    data = update.model_dump(exclude_unset=True)
     if data.pop("clear_auth_token", False):
         settings["auth_token"] = ""
     if "auth_token" in data:
