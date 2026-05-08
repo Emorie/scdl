@@ -95,6 +95,7 @@ scdl me -f
 --opus                          Prefer downloading opus streams over mp3 streams
 --best-quality                  Try to download lossless audio first, converting to FLAC when
                                 available, and fall back to the next best quality
+--list-qualities                List available stream qualities for a track
 --retries <retries>             Retry failed network requests up to <retries> times
 ```
 
@@ -110,3 +111,137 @@ scdl me -f
 * Sync Playlist
 * Set the tags with mutagen (Title / Artist / Album / Artwork)
 * Create playlist files when downloading a playlist
+
+## Docker Web App
+
+This fork includes a NAS-friendly FastAPI web wrapper for `scdl`. It is a UI and
+queue around the existing CLI; it does not replace the downloader logic.
+
+Default web downloads run:
+
+```bash
+scdl -l URL --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3
+```
+
+`Best Original Available` is the default preset. It uses this fork's
+`--best-quality` behavior: try original/lossless first, convert original
+lossless sources to FLAC when the CLI confirms that path is available, then fall
+back to the best available stream. The web app does not transcode MP3 or Opus to
+FLAC and call that lossless.
+
+### Web Presets
+
+| Preset | Command arguments |
+| --- | --- |
+| Best Original Available | `scdl -l URL --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Original Only | `scdl -l URL --only-original --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Prefer Opus | `scdl -l URL --opus --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Stream Only / No Original | `scdl -l URL --no-original --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Check Qualities | `scdl -l URL --list-qualities` |
+| My Likes Best Quality | `scdl me -f --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Playlist Best Quality | `scdl -l URL --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Metadata Repair / Force Metadata | `scdl -l URL --force-metadata --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+
+If a SoundCloud auth token is configured, the web app appends
+`--auth-token TOKEN` to relevant `scdl` commands and masks it in browser logs.
+
+### NAS Install
+
+1. Clone this repo:
+
+   ```bash
+   git clone https://github.com/Emorie/scdl.git
+   cd scdl
+   ```
+
+2. Open your Docker, UGREEN, Synology, or Portainer project editor.
+3. Paste `docker-compose.yml`.
+4. Adjust the volume paths if needed:
+   - `/downloads` is where audio files are saved.
+   - `/config` stores settings, archive, and logs.
+5. Build or redeploy the stack.
+6. Open:
+
+   ```text
+   http://NAS-IP:8090
+   ```
+
+7. Paste a SoundCloud URL.
+8. Choose `Best Original Available`.
+9. Click `Check Qualities` if desired.
+10. Start the download.
+
+### Docker Compose
+
+```yaml
+services:
+  scdl-web:
+    build: .
+    container_name: scdl_web
+    ports:
+      - "8090:8090"
+    environment:
+      - PUID=1001
+      - PGID=100
+      - TZ=America/New_York
+      - DOWNLOAD_DIR=/downloads
+      - CONFIG_DIR=/config
+      - DEFAULT_PRESET=best-original
+      - SOUNDCLOUD_AUTH_TOKEN=
+      - MAX_CONCURRENT_DOWNLOADS=1
+    volumes:
+      - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
+      - /volume3/docker/music-stack/appdata/scdl:/config
+    restart: unless-stopped
+```
+
+### Auth Token
+
+Auth may be needed for likes, private or limited tracks, and some
+original-quality downloads.
+
+Set it one of two ways:
+
+- In Docker Compose: `SOUNDCLOUD_AUTH_TOKEN=your-token`
+- In the web UI settings panel. The value is saved to `/config/settings.json`.
+
+Tokens are masked in browser logs and command displays.
+
+### Paths
+
+- Downloads: `/downloads`
+- Settings: `/config/settings.json`
+- Archive: `/config/archive.txt`
+- Logs: `/config/logs`
+
+### Updating on NAS
+
+```bash
+cd /volume3/docker/music-stack/apps/scdl-web
+git pull
+docker compose up -d --build
+```
+
+Shortcut from the repo folder:
+
+```bash
+bash scripts/update.sh
+```
+
+The expected NAS folder layout keeps app code, config, and downloads separate:
+
+- App code: `/volume3/docker/music-stack/apps/scdl-web`
+- Config: `/volume3/docker/music-stack/appdata/scdl`
+- Downloads: `/volume1/arr-stack-music/downloads/music/soundcloud`
+
+### Troubleshooting
+
+- Open `/health` or the Health card in the web UI.
+- If `scdl` is unavailable, rebuild the image so `pip install -e .` runs.
+- If `ffmpeg` is unavailable, rebuild the Docker image; the Dockerfile installs
+  it with apt.
+- If `/downloads` or `/config` is not writable, check your mounted NAS paths and
+  `PUID`/`PGID`.
+- If likes or original downloads fail, add a valid SoundCloud auth token.
+- If a download is skipped, check `/config/archive.txt` or temporarily disable
+  archive for that queue item.

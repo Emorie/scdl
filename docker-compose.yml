@@ -1,0 +1,23 @@
+# NAS folder layout:
+# - App code: /volume3/docker/music-stack/apps/scdl-web
+# - Config:   /volume3/docker/music-stack/appdata/scdl
+# - Music:    /volume1/arr-stack-music/downloads/music/soundcloud
+services:
+  scdl-web:
+    build: .
+    container_name: scdl_web
+    ports:
+      - "8090:8090"
+    environment:
+      - PUID=1001
+      - PGID=100
+      - TZ=America/New_York
+      - DOWNLOAD_DIR=/downloads
+      - CONFIG_DIR=/config
+      - DEFAULT_PRESET=best-original
+      - SOUNDCLOUD_AUTH_TOKEN=
+      - MAX_CONCURRENT_DOWNLOADS=1
+    volumes:
+      - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
+      - /volume3/docker/music-stack/appdata/scdl:/config
+    restart: unless-stopped

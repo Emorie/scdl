@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SoundCloud Quality Downloader</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">scdl web</p>
+          <h1>SoundCloud Quality Downloader</h1>
+          <p class="subtitle">Original-first SoundCloud downloads powered by scdl</p>
+        </div>
+        <div class="topbar-status">
+          <span id="health-pill" class="pill neutral">Checking health</span>
+          <span id="queue-pill" class="pill neutral">Queue paused</span>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="stack wide">
+          <section class="panel primary-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Download</h2>
+                <p>Paste one URL or a batch. Downloads run through the real scdl CLI.</p>
+              </div>
+              <button id="paste-button" class="ghost-button" type="button">Paste</button>
+            </div>
+
+            <label class="field">
+              <span>SoundCloud URL batch</span>
+              <textarea
+                id="url-input"
+                rows="7"
+                placeholder="https://soundcloud.com/artist/track&#10;https://soundcloud.com/artist/sets/playlist"
+              ></textarea>
+            </label>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>Preset</span>
+                <select id="preset-select"></select>
+              </label>
+              <label class="field inline-check">
+                <input id="archive-for-download" type="checkbox" checked />
+                <span>Use archive for this download</span>
+              </label>
+            </div>
+
+            <div class="action-row">
+              <button id="check-button" class="secondary-button" type="button">Check Qualities</button>
+              <button id="add-button" class="secondary-button" type="button">Add to Queue</button>
+              <button id="start-download-button" class="primary-button" type="button">Start Download</button>
+            </div>
+          </section>
+
+          <section id="preset-panel" class="panel preset-panel">
+            <div class="panel-head">
+              <div>
+                <h2 id="preset-title">Best Original Available</h2>
+                <p id="preset-copy">Tries original/lossless first, then falls back to the best available stream.</p>
+              </div>
+              <span id="preset-badge" class="quality-badge strong">Default</span>
+            </div>
+            <div class="quality-key">
+              <span class="quality-badge original">True original/lossless</span>
+              <span class="quality-badge flac">FLAC from original</span>
+              <span class="quality-badge opus">Opus fallback</span>
+              <span class="quality-badge mp3">MP3/M4A fallback</span>
+              <span class="quality-badge skipped">Already downloaded</span>
+              <span class="quality-badge failed">Failed</span>
+            </div>
+          </section>
+
+          <section class="panel" id="quality-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Quality Results</h2>
+                <p>Results from <code>scdl -l URL --list-qualities</code>.</p>
+              </div>
+              <span id="quality-status" class="pill neutral">No check yet</span>
+            </div>
+            <div id="quality-badges" class="badge-row"></div>
+            <div id="quality-list" class="quality-list empty-state">Check a track to inspect available streams.</div>
+            <pre id="quality-raw" class="log-view hidden"></pre>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Queue</h2>
+                <p>One at a time by default to stay gentle with SoundCloud rate limits.</p>
+              </div>
+              <div class="compact-actions">
+                <button id="queue-start" class="small-button" type="button">Start</button>
+                <button id="queue-pause" class="small-button" type="button">Pause</button>
+                <button id="retry-failed" class="small-button" type="button">Retry Failed</button>
+              </div>
+            </div>
+            <div class="queue-tools">
+              <button id="clear-completed" class="ghost-button" type="button">Clear Completed</button>
+              <button id="clear-all" class="danger-button" type="button">Clear All</button>
+            </div>
+            <div id="queue-list" class="queue-list empty-state">No downloads queued yet.</div>
+          </section>
+        </section>
+
+        <aside class="stack side">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Settings</h2>
+                <p>Saved in <code>/config/settings.json</code>.</p>
+              </div>
+              <button id="save-settings" class="small-button" type="button">Save</button>
+            </div>
+            <div class="settings-grid">
+              <label class="field">
+                <span>SoundCloud auth token</span>
+                <input id="auth-token" type="password" autocomplete="off" placeholder="Masked when saved" />
+              </label>
+              <button id="clear-token" class="ghost-button full" type="button">Clear token</button>
+              <label class="field">
+                <span>Name format</span>
+                <input id="name-format" type="text" placeholder="{title}" />
+              </label>
+              <label class="field">
+                <span>Playlist format</span>
+                <input id="playlist-format" type="text" placeholder="{playlist[title]}_{title}" />
+              </label>
+              <label class="field">
+                <span>Max concurrent downloads</span>
+                <input id="max-concurrent" type="number" min="1" step="1" />
+              </label>
+              <div class="toggle-list">
+                <label><input id="archive-enabled" type="checkbox" /> Archive by default</label>
+                <label><input id="artist-folders" type="checkbox" /> Artist folders</label>
+                <label><input id="flat-folder" type="checkbox" /> Flat playlist folder mode</label>
+                <label><input id="original-art" type="checkbox" /> Original artwork</label>
+                <label><input id="add-description" type="checkbox" /> Description text files</label>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Archive</h2>
+                <p id="archive-path">/config/archive.txt</p>
+              </div>
+              <span id="archive-count" class="pill neutral">0 items</span>
+            </div>
+            <div class="action-row tight">
+              <a class="small-link" href="/api/archive/export">Export</a>
+              <label class="file-button">
+                Import
+                <input id="archive-import" type="file" accept=".txt,text/plain" />
+              </label>
+              <button id="clear-archive" class="danger-button" type="button">Clear</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Recent Downloads</h2>
+                <p id="download-path">/downloads</p>
+              </div>
+              <button id="refresh-recent" class="small-button" type="button">Refresh</button>
+            </div>
+            <div id="recent-list" class="recent-list empty-state">No files found.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Health</h2>
+                <p>Runtime checks for Docker and NAS paths.</p>
+              </div>
+              <button id="refresh-health" class="small-button" type="button">Check</button>
+            </div>
+            <div id="health-list" class="health-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <div id="modal-root" class="modal-root hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h2 id="modal-title">Confirm</h2>
+        <p id="modal-copy">Are you sure?</p>
+        <div class="action-row right">
+          <button id="modal-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="modal-confirm" class="danger-button" type="button">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
