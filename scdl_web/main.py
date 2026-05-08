@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -28,12 +29,15 @@ CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config")).resolve()
 LOG_DIR = CONFIG_DIR / "logs"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 ARCHIVE_PATH = CONFIG_DIR / "archive.txt"
+DB_PATH = CONFIG_DIR / "app.db"
 STATIC_DIR = Path(__file__).with_name("static")
 
 TOKEN_MASK = "********"
 MAX_LOG_LINES = 1200
 RECENT_FILE_LIMIT = 100
 ARCHIVE_IMPORT_LIMIT = 5 * 1024 * 1024
+ACTIVE_STATUSES = {"Pending", "Running"}
+TERMINAL_STATUSES = {"Done", "Failed", "Skipped", "Cancelled"}
 MEDIA_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -58,6 +62,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "auth_token": "",
     "archive_enabled": True,
@@ -68,6 +79,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "original_art": False,
     "add_description": False,
     "max_concurrent_downloads": env_int("MAX_CONCURRENT_DOWNLOADS", 1),
+    "download_delay_seconds": env_float("DOWNLOAD_DELAY_SECONDS", 2),
     "default_preset": os.environ.get("DEFAULT_PRESET", "best-original"),
 }
 
@@ -158,6 +170,7 @@ class SettingsUpdate(BaseModel):
     original_art: Optional[bool] = None
     add_description: Optional[bool] = None
     max_concurrent_downloads: Optional[int] = None
+    download_delay_seconds: Optional[float] = None
     default_preset: Optional[str] = None
 
 
@@ -171,16 +184,21 @@ class QueueItem:
     preset_id: str
     preset_name: str
     target: str
+    target_url: str
     command: list[str]
     masked_command: list[str]
     log_path: Path
     archive_enabled: bool
+    is_likes_sync: bool = False
     status: str = "Pending"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     return_code: Optional[int] = None
+    output_file: Optional[str] = None
+    track_id: Optional[str] = None
+    last_error: Optional[str] = None
     logs: list[str] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
@@ -193,14 +211,19 @@ class QueueItem:
             "preset_id": self.preset_id,
             "preset_name": self.preset_name,
             "target": self.target,
+            "target_url": self.target_url,
             "command": self.masked_command,
             "archive_enabled": self.archive_enabled,
+            "is_likes_sync": self.is_likes_sync,
             "status": self.status,
             "created_at": iso_time(self.created_at),
             "updated_at": iso_time(self.updated_at),
             "started_at": iso_time(self.started_at),
             "finished_at": iso_time(self.finished_at),
             "return_code": self.return_code,
+            "output_file": self.output_file,
+            "track_id": self.track_id,
+            "last_error": self.last_error,
             "logs": self.logs[-200:],
             "log_path": str(self.log_path),
             "files": self.files,
@@ -221,6 +244,286 @@ def ensure_directories() -> None:
     ARCHIVE_PATH.touch(exist_ok=True)
 
 
+def db_connect() -> sqlite3.Connection:
+    ensure_directories()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS queue_items (
+                id TEXT PRIMARY KEY,
+                preset_id TEXT NOT NULL,
+                preset_name TEXT NOT NULL,
+                target TEXT NOT NULL,
+                target_url TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                archive_enabled INTEGER NOT NULL DEFAULT 1,
+                is_likes_sync INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                return_code INTEGER,
+                log_path TEXT,
+                files_json TEXT NOT NULL DEFAULT '[]',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                output_file TEXT,
+                track_id TEXT,
+                last_error TEXT
+            )
+            """,
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue_items(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_updated ON queue_items(updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_likes ON queue_items(is_likes_sync, status)")
+        conn.execute(
+            """
+            UPDATE queue_items
+            SET status = 'Pending',
+                updated_at = ?,
+                last_error = COALESCE(last_error, 'Recovered after app restart; archive will skip completed tracks.')
+            WHERE status = 'Running'
+            """,
+            (time.time(),),
+        )
+        conn.commit()
+
+
+def json_loads(value: Optional[str], fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def row_to_item(row: sqlite3.Row) -> QueueItem:
+    preset_id = row["preset_id"]
+    target_url = row["target_url"] or row["target"]
+    try:
+        command, masked, archive_enabled = build_scdl_args(
+            preset_id,
+            target_url,
+            archive_enabled=bool(row["archive_enabled"]),
+        )
+    except HTTPException:
+        command, masked, archive_enabled = [], [], bool(row["archive_enabled"])
+    return QueueItem(
+        id=row["id"],
+        preset_id=preset_id,
+        preset_name=row["preset_name"],
+        target=row["target"],
+        target_url=target_url,
+        command=command,
+        masked_command=masked,
+        archive_enabled=archive_enabled,
+        is_likes_sync=bool(row["is_likes_sync"]),
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        return_code=row["return_code"],
+        output_file=row["output_file"],
+        track_id=row["track_id"],
+        last_error=row["last_error"],
+        log_path=Path(row["log_path"] or LOG_DIR / f"{row['id']}.log"),
+        files=json_loads(row["files_json"], []),
+        summary=json_loads(row["summary_json"], {}),
+    )
+
+
+def persist_item(item: QueueItem) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO queue_items (
+                id, preset_id, preset_name, target, target_url, status, archive_enabled,
+                is_likes_sync, created_at, updated_at, started_at, finished_at,
+                return_code, log_path, files_json, summary_json, output_file,
+                track_id, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                preset_id = excluded.preset_id,
+                preset_name = excluded.preset_name,
+                target = excluded.target,
+                target_url = excluded.target_url,
+                status = excluded.status,
+                archive_enabled = excluded.archive_enabled,
+                is_likes_sync = excluded.is_likes_sync,
+                updated_at = excluded.updated_at,
+                started_at = excluded.started_at,
+                finished_at = excluded.finished_at,
+                return_code = excluded.return_code,
+                log_path = excluded.log_path,
+                files_json = excluded.files_json,
+                summary_json = excluded.summary_json,
+                output_file = excluded.output_file,
+                track_id = excluded.track_id,
+                last_error = excluded.last_error
+            """,
+            (
+                item.id,
+                item.preset_id,
+                item.preset_name,
+                item.target,
+                item.target_url,
+                item.status,
+                int(item.archive_enabled),
+                int(item.is_likes_sync),
+                item.created_at,
+                item.updated_at,
+                item.started_at,
+                item.finished_at,
+                item.return_code,
+                str(item.log_path),
+                json.dumps(item.files),
+                json.dumps(item.summary),
+                item.output_file,
+                item.track_id,
+                item.last_error,
+            ),
+        )
+        conn.commit()
+
+
+def load_active_items() -> list[QueueItem]:
+    init_db()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM queue_items
+            WHERE status IN ('Pending', 'Running')
+            ORDER BY created_at ASC
+            """,
+        ).fetchall()
+    return [row_to_item(row) for row in rows]
+
+
+def history_status_filter(status: str) -> tuple[str, list[Any]]:
+    normalized = status.strip().lower()
+    if normalized in {"downloaded", "done"}:
+        return "status = ?", ["Done"]
+    if normalized in {"failed", "skipped", "pending", "running", "cancelled"}:
+        return "status = ?", [normalized.title()]
+    if normalized == "remaining":
+        return "status IN ('Pending', 'Running')", []
+    return "1 = 1", []
+
+
+def history_query(status: str = "All", search: str = "", page: int = 1, page_size: int = 25) -> dict[str, Any]:
+    init_db()
+    page = max(1, page)
+    page_size = min(100, max(1, page_size))
+    where, params = history_status_filter(status)
+    if search.strip():
+        where += " AND (target LIKE ? OR target_url LIKE ? OR preset_name LIKE ? OR output_file LIKE ? OR last_error LIKE ?)"
+        needle = f"%{search.strip()}%"
+        params.extend([needle, needle, needle, needle, needle])
+    offset = (page - 1) * page_size
+    with db_connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM queue_items WHERE {where}", params).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT * FROM queue_items
+            WHERE {where}
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, offset],
+        ).fetchall()
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": [history_row_public(row) for row in rows],
+    }
+
+
+def history_row_public(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "preset_id": row["preset_id"],
+        "preset_name": row["preset_name"],
+        "target": row["target"],
+        "target_url": row["target_url"],
+        "status": row["status"],
+        "archive_enabled": bool(row["archive_enabled"]),
+        "is_likes_sync": bool(row["is_likes_sync"]),
+        "created_at": iso_time(row["created_at"]),
+        "updated_at": iso_time(row["updated_at"]),
+        "started_at": iso_time(row["started_at"]),
+        "finished_at": iso_time(row["finished_at"]),
+        "return_code": row["return_code"],
+        "output_file": row["output_file"],
+        "track_id": row["track_id"],
+        "last_error": row["last_error"],
+        "summary": json_loads(row["summary_json"], {}),
+    }
+
+
+def app_stats() -> dict[str, Any]:
+    init_db()
+    with db_connect() as conn:
+        rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_items GROUP BY status").fetchall()
+        history_count = conn.execute("SELECT COUNT(*) FROM queue_items").fetchone()[0]
+        likes = conn.execute(
+            """
+            SELECT * FROM queue_items
+            WHERE is_likes_sync = 1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+        ).fetchone()
+        recent_failures = conn.execute(
+            """
+            SELECT * FROM queue_items
+            WHERE status = 'Failed'
+            ORDER BY updated_at DESC
+            LIMIT 5
+            """,
+        ).fetchall()
+    counts = {row["status"]: row["count"] for row in rows}
+    downloaded = counts.get("Done", 0)
+    failed = counts.get("Failed", 0)
+    skipped = counts.get("Skipped", 0)
+    pending = counts.get("Pending", 0)
+    running = counts.get("Running", 0)
+    return {
+        "history_count": history_count,
+        "archive_count": archive_count(),
+        "total_processed": downloaded + failed + skipped,
+        "downloaded": downloaded,
+        "failed": failed,
+        "skipped": skipped,
+        "pending": pending,
+        "running": running,
+        "remaining_unknown": pending + running,
+        "latest_likes_sync": history_row_public(likes) if likes else None,
+        "recent_failures": [history_row_public(row) for row in recent_failures],
+    }
+
+
+def failed_likes_items() -> list[QueueItem]:
+    init_db()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM queue_items
+            WHERE is_likes_sync = 1 AND status = 'Failed'
+            ORDER BY updated_at ASC
+            """,
+        ).fetchall()
+    return [row_to_item(row) for row in rows]
+
+
 def load_settings() -> dict[str, Any]:
     ensure_directories()
     settings = dict(DEFAULT_SETTINGS)
@@ -234,7 +537,14 @@ def load_settings() -> dict[str, Any]:
             SETTINGS_PATH.replace(backup)
     if settings.get("default_preset") not in PRESETS:
         settings["default_preset"] = "best-original"
-    settings["max_concurrent_downloads"] = max(1, int(settings.get("max_concurrent_downloads") or 1))
+    try:
+        settings["max_concurrent_downloads"] = max(1, int(settings.get("max_concurrent_downloads") or 1))
+    except (TypeError, ValueError):
+        settings["max_concurrent_downloads"] = 1
+    try:
+        settings["download_delay_seconds"] = max(0.0, float(settings.get("download_delay_seconds") or 0))
+    except (TypeError, ValueError):
+        settings["download_delay_seconds"] = 2
     save_settings(settings)
     return settings
 
@@ -260,6 +570,7 @@ def public_settings() -> dict[str, Any]:
             "download_dir": str(DOWNLOAD_DIR),
             "config_dir": str(CONFIG_DIR),
             "archive_path": str(ARCHIVE_PATH),
+            "history_path": str(DB_PATH),
             "logs_dir": str(LOG_DIR),
         },
     )
@@ -353,12 +664,16 @@ def build_scdl_args(
         target = validate_soundcloud_url(target)
     else:
         target = "me likes"
+        if not get_auth_token(settings):
+            raise HTTPException(status_code=400, detail="A SoundCloud auth token is required for My Likes Sync")
 
     args: list[str] = []
     for arg in preset.args:
         args.append(target if arg == "{url}" else arg)
 
     should_use_archive = settings.get("archive_enabled", True) if archive_enabled is None else archive_enabled
+    if preset.id == "likes-best":
+        should_use_archive = True
 
     if preset.downloads:
         target_download_dir = DOWNLOAD_DIR
@@ -507,6 +822,16 @@ def summarize_logs(logs: list[str], files: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+def is_auth_related_error(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(invalid auth|auth token|unauthorized|forbidden|401|403|login required|oauth)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def parse_quality_output(output: str) -> dict[str, Any]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     qualities = []
@@ -538,7 +863,15 @@ class QueueManager:
         self.items: list[QueueItem] = []
         self.lock = asyncio.Lock()
         self.paused = True
+        self.stop_after_current = False
         self.subscribers: set[asyncio.Queue] = set()
+
+    async def load_from_db(self) -> None:
+        items = load_active_items()
+        async with self.lock:
+            self.items = items
+            self.paused = True
+            self.stop_after_current = False
 
     async def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -559,6 +892,7 @@ class QueueManager:
         async with self.lock:
             return {
                 "paused": self.paused,
+                "stop_after_current": self.stop_after_current,
                 "max_concurrent_downloads": load_settings()["max_concurrent_downloads"],
                 "items": [item.public() for item in self.items],
             }
@@ -576,6 +910,10 @@ class QueueManager:
 
         created: list[QueueItem] = []
         async with self.lock:
+            if preset.id == "likes-best" and any(
+                item.is_likes_sync and item.status in ACTIVE_STATUSES for item in self.items
+            ):
+                raise HTTPException(status_code=409, detail="A Likes Sync job is already pending or running")
             for target in targets:
                 command, masked, archive_enabled = build_scdl_args(
                     request.preset,
@@ -583,17 +921,21 @@ class QueueManager:
                     archive_enabled=request.archive_enabled,
                 )
                 job_id = uuid.uuid4().hex[:12]
+                is_likes_sync = preset.id == "likes-best"
                 item = QueueItem(
                     id=job_id,
                     preset_id=preset.id,
                     preset_name=preset.name,
                     target=target if preset.needs_url else "My likes",
+                    target_url=target if preset.needs_url else "me likes",
                     command=command,
                     masked_command=masked,
                     archive_enabled=archive_enabled,
+                    is_likes_sync=is_likes_sync,
                     log_path=LOG_DIR / f"{job_id}.log",
                 )
                 self.items.append(item)
+                persist_item(item)
                 created.append(item)
             if request.autostart:
                 self.paused = False
@@ -605,6 +947,7 @@ class QueueManager:
     async def start(self) -> None:
         async with self.lock:
             self.paused = False
+            self.stop_after_current = False
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
         await self.kick()
 
@@ -615,7 +958,7 @@ class QueueManager:
 
     async def kick(self) -> None:
         async with self.lock:
-            if self.paused:
+            if self.paused or self.stop_after_current:
                 return
             settings = load_settings()
             max_concurrent = max(1, int(settings["max_concurrent_downloads"]))
@@ -626,6 +969,7 @@ class QueueManager:
                 item.status = "Running"
                 item.started_at = time.time()
                 item.updated_at = item.started_at
+                persist_item(item)
                 item.task = asyncio.create_task(self.run_item(item))
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
 
@@ -640,6 +984,12 @@ class QueueManager:
                     continue
                 item.logs.append(line)
                 item.logs = item.logs[-MAX_LOG_LINES:]
+                if re.search(
+                    r"\b(error|failed|unable|could not|invalid auth|unauthorized|forbidden|rate limit|401|403|429)\b",
+                    line,
+                    re.IGNORECASE,
+                ):
+                    item.last_error = line[-500:]
                 handle.write(line + "\n")
                 await self.broadcast({"type": "log", "item_id": item.id, "line": line})
         item.updated_at = time.time()
@@ -647,6 +997,27 @@ class QueueManager:
     async def run_item(self, item: QueueItem) -> None:
         before = snapshot_files()
         item.log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            command, masked, archive_enabled = build_scdl_args(
+                item.preset_id,
+                item.target_url,
+                archive_enabled=item.archive_enabled,
+            )
+            item.command = command
+            item.masked_command = masked
+            item.archive_enabled = archive_enabled
+            persist_item(item)
+        except HTTPException as exc:
+            item.return_code = 1
+            item.last_error = str(exc.detail)
+            item.logs.append(item.last_error)
+            item.status = "Failed"
+            item.finished_at = time.time()
+            item.updated_at = item.finished_at
+            persist_item(item)
+            await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
+            await self.kick()
+            return
         item.log_path.write_text(
             "Command: " + " ".join(item.masked_command) + "\n\n",
             encoding="utf-8",
@@ -673,14 +1044,18 @@ class QueueManager:
         except asyncio.CancelledError:
             await self.terminate_process(item)
             item.status = "Cancelled"
+            item.last_error = "Cancelled by user"
             await self.append_log(item, "Cancelled by user")
             raise
         except Exception as exc:
             item.return_code = 1
-            await self.append_log(item, f"Failed to start scdl: {exc}")
+            item.last_error = f"Failed to start scdl: {exc}"
+            await self.append_log(item, item.last_error)
         finally:
             item.process = None
             item.files = new_or_changed_files(before)
+            if item.files:
+                item.output_file = item.files[0].get("path")
             item.summary = summarize_logs(item.logs, item.files)
             item.finished_at = time.time()
             item.updated_at = item.finished_at
@@ -691,7 +1066,25 @@ class QueueManager:
                     item.status = "Done"
                 else:
                     item.status = "Failed"
+                    if not item.last_error and item.summary.get("warnings"):
+                        item.last_error = item.summary["warnings"][-1]
+            auth_error = item.status == "Failed" and is_auth_related_error(
+                "\n".join([item.last_error or "", *item.logs[-40:]])
+            )
+            if auth_error:
+                item.summary.setdefault("warnings", []).append("Authentication-related failure detected; queue paused.")
+                item.last_error = item.last_error or "Authentication-related failure detected; queue paused."
+            persist_item(item)
+            async with self.lock:
+                if auth_error:
+                    self.paused = True
+                if self.stop_after_current:
+                    self.paused = True
+                    self.stop_after_current = False
             await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
+            delay = load_settings().get("download_delay_seconds", 0)
+            if delay and not self.paused:
+                await asyncio.sleep(float(delay))
             await self.kick()
 
     async def terminate_process(self, item: QueueItem) -> None:
@@ -716,6 +1109,8 @@ class QueueManager:
                     pending_item.status = "Cancelled"
                     pending_item.finished_at = time.time()
                     pending_item.updated_at = pending_item.finished_at
+                    pending_item.last_error = "Cancelled before running"
+                    persist_item(pending_item)
                     cancelled_pending = True
             candidates = [item for item in self.items if item.status == "Running"]
             if item_id:
@@ -749,7 +1144,10 @@ class QueueManager:
             item.logs = []
             item.files = []
             item.summary = {}
+            item.last_error = None
+            item.output_file = None
             item.updated_at = time.time()
+            persist_item(item)
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
         await self.kick()
 
@@ -764,13 +1162,91 @@ class QueueManager:
                     item.logs = []
                     item.files = []
                     item.summary = {}
+                    item.last_error = None
+                    item.output_file = None
                     item.updated_at = time.time()
+                    persist_item(item)
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
         await self.kick()
 
+    async def start_or_resume_likes_sync(self, retry_failed_only: bool = False) -> QueueItem:
+        if not get_auth_token():
+            raise HTTPException(status_code=400, detail="A SoundCloud auth token is required for My Likes Sync")
+
+        async with self.lock:
+            active = next(
+                (item for item in self.items if item.is_likes_sync and item.status in ACTIVE_STATUSES),
+                None,
+            )
+            if active:
+                self.paused = False
+                self.stop_after_current = False
+                selected = active
+            else:
+                selected = None
+
+        if selected:
+            await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
+            await self.kick()
+            return selected
+
+        failed = failed_likes_items()
+        if retry_failed_only:
+            if not failed:
+                raise HTTPException(status_code=404, detail="No failed Likes Sync jobs to retry")
+            selected = failed[-1]
+        elif failed:
+            selected = failed[-1]
+
+        if selected:
+            selected.status = "Pending"
+            selected.return_code = None
+            selected.started_at = None
+            selected.finished_at = None
+            selected.logs = []
+            selected.files = []
+            selected.summary = {}
+            selected.output_file = None
+            selected.last_error = None
+            selected.updated_at = time.time()
+            persist_item(selected)
+            async with self.lock:
+                if not any(item.id == selected.id for item in self.items):
+                    self.items.append(selected)
+                self.paused = False
+                self.stop_after_current = False
+            await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
+            await self.kick()
+            return selected
+
+        created = await self.add(
+            QueueAddRequest(
+                urls="",
+                preset="likes-best",
+                autostart=True,
+                archive_enabled=True,
+            ),
+        )
+        return created[0]
+
+    async def stop_after_current_item(self) -> None:
+        async with self.lock:
+            self.stop_after_current = True
+            pending = [item for item in self.items if item.status == "Pending"]
+            if not any(item.status == "Running" for item in self.items):
+                self.paused = True
+                self.stop_after_current = False
+            for item in pending:
+                item.status = "Cancelled"
+                item.finished_at = time.time()
+                item.updated_at = item.finished_at
+                item.last_error = "Cancelled by stop-after-current"
+                persist_item(item)
+        await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
+
     async def clear_completed(self) -> None:
         async with self.lock:
-            self.items = [item for item in self.items if item.status not in {"Done", "Failed", "Skipped", "Cancelled"}]
+            self.items = [item for item in self.items if item.status not in TERMINAL_STATUSES]
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
 
     async def clear_all(self) -> None:
@@ -779,8 +1255,16 @@ class QueueManager:
         for item in running:
             await self.cancel(item.id)
         async with self.lock:
+            for item in self.items:
+                if item.status in ACTIVE_STATUSES:
+                    item.status = "Cancelled"
+                    item.finished_at = time.time()
+                    item.updated_at = item.finished_at
+                    item.last_error = "Cancelled by clear all"
+                    persist_item(item)
             self.items = []
             self.paused = True
+            self.stop_after_current = False
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
 
 
@@ -790,7 +1274,9 @@ queue_manager = QueueManager()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ensure_directories()
+    init_db()
     load_settings()
+    await queue_manager.load_from_db()
     yield
 
 
@@ -840,6 +1326,8 @@ async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
     for key, value in data.items():
         if key == "max_concurrent_downloads" and value is not None:
             settings[key] = max(1, int(value))
+        elif key == "download_delay_seconds" and value is not None:
+            settings[key] = max(0.0, float(value))
         elif key == "default_preset" and value in PRESETS:
             settings[key] = value
         elif key != "default_preset":
@@ -847,6 +1335,33 @@ async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
     save_settings(settings)
     await queue_manager.kick()
     return public_settings()
+
+
+def check_soundcloud_auth(token: str) -> dict[str, Any]:
+    if not token:
+        raise HTTPException(status_code=400, detail="No SoundCloud auth token is configured")
+    try:
+        from soundcloud import SoundCloud
+
+        client = SoundCloud(None, token)
+        if not client.is_auth_token_valid():
+            return {"ok": False, "message": "SoundCloud rejected this auth token"}
+        me = client.get_me()
+        return {
+            "ok": True,
+            "message": "Auth token is valid",
+            "user": getattr(me, "username", None),
+            "user_id": getattr(me, "id", None),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return {"ok": False, "message": f"Auth check failed: {mask_text(str(exc), token)}"}
+
+
+@app.post("/api/auth/test")
+async def test_auth() -> dict[str, Any]:
+    return await asyncio.to_thread(check_soundcloud_auth, get_auth_token())
 
 
 @app.get("/api/queue")
@@ -884,6 +1399,12 @@ async def cancel_current() -> dict[str, Any]:
     return await queue_manager.snapshot()
 
 
+@app.post("/api/queue/stop-after-current")
+async def stop_after_current() -> dict[str, Any]:
+    await queue_manager.stop_after_current_item()
+    return await queue_manager.snapshot()
+
+
 @app.post("/api/queue/{item_id}/cancel")
 async def cancel_item(item_id: str) -> dict[str, Any]:
     await queue_manager.cancel(item_id)
@@ -914,6 +1435,39 @@ async def clear_all(confirm: ConfirmRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Confirmation required")
     await queue_manager.clear_all()
     return await queue_manager.snapshot()
+
+
+@app.post("/api/likes/start")
+async def start_likes_sync() -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=False)
+    return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
+
+
+@app.post("/api/likes/resume")
+async def resume_likes_sync() -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=False)
+    return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
+
+
+@app.post("/api/likes/retry-failed")
+async def retry_failed_likes_sync() -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=True)
+    return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
+
+
+@app.get("/api/history")
+async def get_history(
+    status: str = "All",
+    search: str = "",
+    page: int = 1,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    return history_query(status=status, search=search, page=page, page_size=page_size)
+
+
+@app.get("/api/stats")
+async def get_stats() -> dict[str, Any]:
+    return app_stats()
 
 
 async def run_collect(command: list[str], masked_command: list[str], log_path: Path) -> tuple[int, str]:
@@ -1043,6 +1597,16 @@ def health_payload() -> dict[str, Any]:
         archive_message = "accessible"
     except OSError as exc:
         archive_message = str(exc)
+    db_ok = False
+    db_message = "unknown"
+    try:
+        init_db()
+        with db_connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+        db_ok = True
+        db_message = "accessible"
+    except Exception as exc:
+        db_message = str(exc)
     scdl_path = shutil.which(scdl_command())
     ffmpeg_path = shutil.which("ffmpeg")
     return {
@@ -1057,6 +1621,7 @@ def health_payload() -> dict[str, Any]:
         "downloads": {"ok": DOWNLOAD_DIR.exists() and downloads_writable, "path": str(DOWNLOAD_DIR), "message": downloads_message},
         "config": {"ok": CONFIG_DIR.exists() and config_writable, "path": str(CONFIG_DIR), "message": config_message},
         "archive": {"ok": archive_ok, "path": str(ARCHIVE_PATH), "message": archive_message, "count": archive_count()},
+        "history": {"ok": db_ok, "path": str(DB_PATH), "message": db_message},
         "logs": {"ok": LOG_DIR.exists() and logs_writable, "path": str(LOG_DIR), "message": logs_message},
         "python": sys.version.split()[0],
     }

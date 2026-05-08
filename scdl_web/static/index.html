@@ -76,6 +76,33 @@
             </div>
           </section>
 
+          <section class="panel likes-panel">
+            <div class="panel-head">
+              <div>
+                <h2>My Likes Sync</h2>
+                <p>Best Original Available for your liked tracks. First syncs of 20k+ likes can take a long time.</p>
+              </div>
+              <span id="auth-status-badge" class="pill neutral">Auth unknown</span>
+            </div>
+            <div class="stats-grid">
+              <div><strong id="stat-archive">0</strong><span>Archive</span></div>
+              <div><strong id="stat-history">0</strong><span>History</span></div>
+              <div><strong id="stat-processed">0</strong><span>Processed</span></div>
+              <div><strong id="stat-downloaded">0</strong><span>Downloaded</span></div>
+              <div><strong id="stat-skipped">0</strong><span>Skipped</span></div>
+              <div><strong id="stat-failed">0</strong><span>Failed</span></div>
+              <div><strong id="stat-remaining">0</strong><span>Remaining</span></div>
+            </div>
+            <div class="action-row">
+              <button id="likes-start" class="primary-button" type="button">Start / Resume Likes Sync</button>
+              <button id="likes-retry-failed" class="secondary-button" type="button">Retry Failed Only</button>
+              <button id="stop-after-current" class="danger-button" type="button">Stop After Current Track</button>
+            </div>
+            <div id="likes-current" class="mini-log empty-state">No Likes Sync running.</div>
+            <h3 class="panel-subtitle">Recent Failures</h3>
+            <div id="recent-failures" class="history-list empty-state">No recent failures.</div>
+          </section>
+
           <section class="panel" id="quality-panel">
             <div class="panel-head">
               <div>
@@ -123,7 +150,10 @@
                 <span>SoundCloud auth token</span>
                 <input id="auth-token" type="password" autocomplete="off" placeholder="Masked when saved" />
               </label>
-              <button id="clear-token" class="ghost-button full" type="button">Clear token</button>
+              <div class="action-row tight">
+                <button id="test-auth" class="small-button" type="button">Test Auth</button>
+                <button id="clear-token" class="ghost-button" type="button">Clear token</button>
+              </div>
               <label class="field">
                 <span>Name format</span>
                 <input id="name-format" type="text" placeholder="{title}" />
@@ -135,6 +165,10 @@
               <label class="field">
                 <span>Max concurrent downloads</span>
                 <input id="max-concurrent" type="number" min="1" step="1" />
+              </label>
+              <label class="field">
+                <span>Delay between downloads</span>
+                <input id="download-delay" type="number" min="0" step="0.5" />
               </label>
               <div class="toggle-list">
                 <label><input id="archive-enabled" type="checkbox" /> Archive by default</label>
@@ -173,6 +207,32 @@
               <button id="refresh-recent" class="small-button" type="button">Refresh</button>
             </div>
             <div id="recent-list" class="recent-list empty-state">No files found.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>History</h2>
+                <p>Paginated status from <code>/config/app.db</code>.</p>
+              </div>
+              <button id="refresh-history" class="small-button" type="button">Refresh</button>
+            </div>
+            <div class="history-filters">
+              <select id="history-filter">
+                <option>All</option>
+                <option>Downloaded</option>
+                <option>Failed</option>
+                <option>Skipped</option>
+                <option>Pending</option>
+              </select>
+              <input id="history-search" type="search" placeholder="Search URL, title, error" />
+            </div>
+            <div id="history-list" class="history-list empty-state">No history yet.</div>
+            <div class="history-pager">
+              <button id="history-prev" class="small-button" type="button">Previous</button>
+              <span id="history-page">Page 1</span>
+              <button id="history-next" class="small-button" type="button">Next</button>
+            </div>
           </section>
 
           <section class="panel">

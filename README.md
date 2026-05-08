@@ -158,7 +158,7 @@ If a SoundCloud auth token is configured, the web app appends
 3. Paste `docker-compose.yml`.
 4. Adjust the volume paths if needed:
    - `/downloads` is where audio files are saved.
-   - `/config` stores settings, archive, and logs.
+   - `/config` stores settings, archive, history, and logs.
 5. Build or redeploy the stack.
 6. Open:
 
@@ -196,6 +196,7 @@ services:
       - DEFAULT_PRESET=best-original
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
+      - DOWNLOAD_DELAY_SECONDS=2
     volumes:
       - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
       - /volume3/docker/music-stack/appdata/scdl:/config
@@ -214,11 +215,45 @@ Set it one of two ways:
 
 Tokens are masked in browser logs and command displays.
 
+### Syncing My SoundCloud Likes
+
+Use the `My Likes Sync` card when you want the app to resume through a large
+liked-track library with the archive enabled.
+
+1. Add your SoundCloud auth token in the Settings/Auth section, or set
+   `SOUNDCLOUD_AUTH_TOKEN` in Docker Compose.
+2. Click `Test Auth` to confirm the token works without downloading anything.
+3. Click `Start / Resume Likes Sync`.
+
+Likes Sync runs the same best-quality CLI path as manual downloads:
+
+```bash
+scdl me -f --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3
+```
+
+When a token is available, the app appends `--auth-token TOKEN` and masks it in
+logs and API responses.
+
+Resume uses two layers:
+
+- `scdl` archive: `/config/archive.txt` is the source of truth for skipping
+  tracks that were already downloaded.
+- App history DB: `/config/app.db` stores queue status, failures, logs, and
+  UI counters so failed jobs can be retried after a restart.
+
+Keep both `/config` and `/downloads` mounted to persistent NAS folders. If the
+container stops or the NAS reboots, start Likes Sync again; `scdl` reloads the
+archive and skips completed tracks. Use `Retry Failed Only` for failed Likes
+Sync jobs. For 20k+ likes, keep `MAX_CONCURRENT_DOWNLOADS=1`; the default
+`DOWNLOAD_DELAY_SECONDS=2` is intentionally rate-limit friendly for normal queue
+items.
+
 ### Paths
 
 - Downloads: `/downloads`
 - Settings: `/config/settings.json`
 - Archive: `/config/archive.txt`
+- History DB: `/config/app.db`
 - Logs: `/config/logs`
 
 ### Updating on NAS

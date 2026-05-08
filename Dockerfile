@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_DIR=/config \
     DEFAULT_PRESET=best-original \
     MAX_CONCURRENT_DOWNLOADS=1 \
+    DOWNLOAD_DELAY_SECONDS=2 \
     TZ=America/New_York
 
 RUN apt-get update \

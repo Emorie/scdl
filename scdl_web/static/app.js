@@ -3,6 +3,8 @@ const state = {
   settings: {},
   queue: { paused: true, items: [] },
   qualityRawVisible: false,
+  historyPage: 1,
+  historyTotal: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -94,10 +96,13 @@ function renderSettings() {
   $("name-format").value = settings.name_format || "";
   $("playlist-format").value = settings.playlist_name_format || "";
   $("max-concurrent").value = settings.max_concurrent_downloads || 1;
+  $("download-delay").value = settings.download_delay_seconds ?? 2;
   $("artist-folders").checked = !!settings.artist_folders;
   $("flat-folder").checked = !!settings.no_playlist_folder;
   $("original-art").checked = !!settings.original_art;
   $("add-description").checked = !!settings.add_description;
+  $("auth-status-badge").textContent = settings.auth_configured ? `Auth: ${settings.auth_source}` : "Auth missing";
+  $("auth-status-badge").className = settings.auth_configured ? "pill ok" : "pill warn";
 }
 
 function statusClass(status) {
@@ -134,10 +139,26 @@ function renderQueue(queue) {
   if (!queue.items.length) {
     list.className = "queue-list empty-state";
     list.textContent = "No downloads queued yet.";
+    renderLikesCurrent(queue);
     return;
   }
   list.className = "queue-list";
   list.innerHTML = queue.items.map(renderQueueItem).join("");
+  renderLikesCurrent(queue);
+}
+
+function renderLikesCurrent(queue) {
+  const running = queue.items.find((item) => item.is_likes_sync && item.status === "Running");
+  const pending = queue.items.find((item) => item.is_likes_sync && item.status === "Pending");
+  const item = running || pending;
+  const node = $("likes-current");
+  if (!item) {
+    node.className = "mini-log empty-state";
+    node.textContent = "No Likes Sync running.";
+    return;
+  }
+  node.className = "mini-log log-view";
+  node.textContent = `${item.status}: ${item.target}\n${(item.logs || []).slice(-8).join("\n")}`;
 }
 
 function renderQueueItem(item) {
@@ -239,6 +260,7 @@ function renderHealth(data) {
     ["downloads", data.downloads?.ok, data.downloads?.path],
     ["config", data.config?.ok, data.config?.path],
     ["archive", data.archive?.ok, `${data.archive?.path} (${data.archive?.count || 0})`],
+    ["history", data.history?.ok, data.history?.path || ""],
     ["logs", data.logs?.ok, data.logs?.path],
   ];
   $("health-list").innerHTML = rows
@@ -256,14 +278,80 @@ function renderHealth(data) {
   $("health-pill").className = allOk ? "pill ok" : "pill warn";
 }
 
+function renderStats(data) {
+  $("stat-archive").textContent = data.archive_count ?? 0;
+  $("stat-history").textContent = data.history_count ?? 0;
+  $("stat-processed").textContent = data.total_processed ?? 0;
+  $("stat-downloaded").textContent = data.downloaded ?? 0;
+  $("stat-skipped").textContent = data.skipped ?? 0;
+  $("stat-failed").textContent = data.failed ?? 0;
+  $("stat-remaining").textContent = data.remaining_unknown ?? 0;
+  const failures = data.recent_failures || [];
+  const failureNode = $("recent-failures");
+  if (!failures.length) {
+    failureNode.className = "history-list empty-state";
+    failureNode.textContent = "No recent failures.";
+    return;
+  }
+  failureNode.className = "history-list";
+  failureNode.innerHTML = failures
+    .map(
+      (item) => `
+        <div class="history-row">
+          <div>
+            <strong>${escapeHtml(item.preset_name)}</strong>
+            <span>${escapeHtml(item.target_url || item.target)}</span>
+            ${item.last_error ? `<span>${escapeHtml(item.last_error)}</span>` : ""}
+          </div>
+          <div>${badgeForStatus(item.status)}</div>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderHistory(data) {
+  state.historyPage = data.page || 1;
+  state.historyTotal = data.total || 0;
+  $("history-page").textContent = `Page ${state.historyPage} (${state.historyTotal} total)`;
+  $("history-prev").disabled = state.historyPage <= 1;
+  $("history-next").disabled = state.historyPage * (data.page_size || 25) >= state.historyTotal;
+  const list = $("history-list");
+  if (!data.items?.length) {
+    list.className = "history-list empty-state";
+    list.textContent = "No matching history yet.";
+    return;
+  }
+  list.className = "history-list";
+  list.innerHTML = data.items
+    .map(
+      (item) => `
+        <div class="history-row">
+          <div>
+            <strong>${escapeHtml(item.preset_name)}</strong>
+            <span>${escapeHtml(item.target_url || item.target)}</span>
+            ${item.last_error ? `<span>${escapeHtml(item.last_error)}</span>` : ""}
+          </div>
+          <div>
+            ${badgeForStatus(item.status)}
+            <span>${escapeHtml(item.updated_at || "")}</span>
+          </div>
+        </div>
+      `,
+    )
+    .join("");
+}
+
 async function loadInitial() {
-  const [presets, settings, queue, health, recent, archive] = await Promise.all([
+  const [presets, settings, queue, health, recent, archive, stats, history] = await Promise.all([
     api("/api/presets"),
     api("/api/settings"),
     api("/api/queue"),
     api("/api/health"),
     api("/api/recent"),
     api("/api/archive"),
+    api("/api/stats"),
+    api("/api/history?page=1&page_size=25"),
   ]);
   state.presets = presets.presets;
   state.settings = settings;
@@ -273,6 +361,8 @@ async function loadInitial() {
   renderHealth(health);
   renderRecent(recent);
   renderArchive(archive);
+  renderStats(stats);
+  renderHistory(history);
 }
 
 async function addToQueue(autostart = false) {
@@ -312,7 +402,7 @@ async function checkQualities() {
   }
 }
 
-async function saveSettings(clearToken = false) {
+async function saveSettings(clearToken = false, options = {}) {
   const tokenValue = $("auth-token").value.trim();
   const payload = {
     clear_auth_token: clearToken,
@@ -325,6 +415,7 @@ async function saveSettings(clearToken = false) {
     original_art: $("original-art").checked,
     add_description: $("add-description").checked,
     max_concurrent_downloads: Number($("max-concurrent").value || 1),
+    download_delay_seconds: Number($("download-delay").value || 0),
     default_preset: selectedPreset(),
   };
   state.settings = await api("/api/settings", {
@@ -332,7 +423,9 @@ async function saveSettings(clearToken = false) {
     body: JSON.stringify(payload),
   });
   renderSettings();
-  toast("Settings saved", "Future queue items will use the new settings.", "ok");
+  if (!options.silent) {
+    toast("Settings saved", "Future queue items will use the new settings.", "ok");
+  }
 }
 
 async function refreshRecent() {
@@ -345,6 +438,20 @@ async function refreshHealth() {
 
 async function refreshArchive() {
   renderArchive(await api("/api/archive"));
+}
+
+async function refreshStats() {
+  renderStats(await api("/api/stats"));
+}
+
+async function refreshHistory(page = state.historyPage) {
+  const params = new URLSearchParams({
+    status: $("history-filter").value,
+    search: $("history-search").value,
+    page: String(page),
+    page_size: "25",
+  });
+  renderHistory(await api(`/api/history?${params}`));
 }
 
 function confirmModal(title, message, onConfirm) {
@@ -371,6 +478,28 @@ function wireEvents() {
   $("queue-start").addEventListener("click", async () => renderQueue(await api("/api/queue/start", { method: "POST", body: "{}" })));
   $("queue-pause").addEventListener("click", async () => renderQueue(await api("/api/queue/pause", { method: "POST", body: "{}" })));
   $("retry-failed").addEventListener("click", async () => renderQueue(await api("/api/queue/retry-failed", { method: "POST", body: "{}" })));
+  $("stop-after-current").addEventListener("click", async () => {
+    renderQueue(await api("/api/queue/stop-after-current", { method: "POST", body: "{}" }));
+    toast("Stop requested", "Pending work was cancelled; a running item will finish first.", "ok");
+  });
+  $("likes-start").addEventListener("click", () =>
+    api("/api/likes/resume", { method: "POST", body: "{}" })
+      .then((data) => {
+        renderQueue(data.queue);
+        renderStats(data.stats);
+        toast("Likes Sync started", "Archive resume is enabled.", "ok");
+      })
+      .catch((error) => toast("Likes Sync failed", error.message, "bad")),
+  );
+  $("likes-retry-failed").addEventListener("click", () =>
+    api("/api/likes/retry-failed", { method: "POST", body: "{}" })
+      .then((data) => {
+        renderQueue(data.queue);
+        renderStats(data.stats);
+        toast("Retrying failed Likes Sync", "Previously archived tracks will be skipped.", "ok");
+      })
+      .catch((error) => toast("Retry failed", error.message, "bad")),
+  );
   $("clear-completed").addEventListener("click", async () => renderQueue(await api("/api/queue/clear-completed", { method: "POST", body: "{}" })));
   $("clear-all").addEventListener("click", () =>
     confirmModal("Clear all queue items", "Running downloads will be cancelled and the queue will be emptied.", async () => {
@@ -379,11 +508,33 @@ function wireEvents() {
     }),
   );
   $("save-settings").addEventListener("click", () => saveSettings(false).catch((error) => toast("Settings failed", error.message, "bad")));
+  $("test-auth").addEventListener("click", async () => {
+    try {
+      const tokenValue = $("auth-token").value.trim();
+      if (tokenValue && tokenValue !== "********") {
+        await saveSettings(false, { silent: true });
+      }
+      const result = await api("/api/auth/test", { method: "POST", body: "{}" });
+      toast(result.ok ? "Auth works" : "Auth failed", result.user || result.message, result.ok ? "ok" : "bad");
+      $("auth-status-badge").textContent = result.ok ? "Auth valid" : "Auth failed";
+      $("auth-status-badge").className = result.ok ? "pill ok" : "pill bad";
+    } catch (error) {
+      toast("Auth check failed", error.message, "bad");
+    }
+  });
   $("clear-token").addEventListener("click", () =>
     confirmModal("Clear auth token", "Private tracks, likes, and some original downloads may stop working.", () => saveSettings(true)),
   );
   $("refresh-recent").addEventListener("click", () => refreshRecent().catch((error) => toast("Refresh failed", error.message, "bad")));
   $("refresh-health").addEventListener("click", () => refreshHealth().catch((error) => toast("Health check failed", error.message, "bad")));
+  $("refresh-history").addEventListener("click", () => refreshHistory(1).catch((error) => toast("History failed", error.message, "bad")));
+  $("history-filter").addEventListener("change", () => refreshHistory(1).catch((error) => toast("History failed", error.message, "bad")));
+  $("history-search").addEventListener("input", () => {
+    clearTimeout(window.historySearchTimer);
+    window.historySearchTimer = setTimeout(() => refreshHistory(1).catch(() => {}), 350);
+  });
+  $("history-prev").addEventListener("click", () => refreshHistory(Math.max(1, state.historyPage - 1)));
+  $("history-next").addEventListener("click", () => refreshHistory(state.historyPage + 1));
   $("clear-archive").addEventListener("click", () =>
     confirmModal("Clear archive", "This removes the already-downloaded record. Future downloads may duplicate files.", async () => {
       await api("/api/archive/clear", { method: "POST", body: JSON.stringify({ confirm: true }) });
@@ -443,6 +594,8 @@ function connectEvents() {
       renderQueue(data.queue);
       refreshRecent().catch(() => {});
       refreshArchive().catch(() => {});
+      refreshStats().catch(() => {});
+      refreshHistory().catch(() => {});
     }
     if (data.type === "log") {
       const item = state.queue.items.find((queueItem) => queueItem.id === data.item_id);

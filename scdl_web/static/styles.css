@@ -383,6 +383,47 @@ button,
   padding-top: 4px;
 }
 
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 10px;
+}
+
+.stats-grid div {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 10px;
+}
+
+.stats-grid strong,
+.stats-grid span {
+  display: block;
+}
+
+.stats-grid strong {
+  font-size: 1.25rem;
+}
+
+.stats-grid span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.mini-log {
+  margin-top: 12px;
+  text-align: left;
+}
+
+.panel-subtitle {
+  margin: 14px 0 8px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
 .quality-list {
   display: grid;
   gap: 9px;
@@ -528,12 +569,14 @@ button,
 }
 
 .recent-list,
-.health-list {
+.health-list,
+.history-list {
   display: grid;
   gap: 9px;
 }
 
-.recent-row {
+.recent-row,
+.history-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
@@ -541,9 +584,27 @@ button,
 }
 
 .recent-row span,
+.history-row span,
 .health-row span {
   color: var(--muted);
   font-size: 0.82rem;
+}
+
+.history-filters {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.5fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.history-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .health-row {
@@ -646,8 +707,14 @@ button,
 
   .form-grid,
   .quality-row,
-  .recent-row {
+  .recent-row,
+  .history-row,
+  .history-filters {
     grid-template-columns: 1fr;
+  }
+
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .action-row button,

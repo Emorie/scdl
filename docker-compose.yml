@@ -24,6 +24,7 @@ services:
       - DEFAULT_PRESET=best-original
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
+      - DOWNLOAD_DELAY_SECONDS=2
     volumes:
       - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
       - /volume3/docker/music-stack/appdata/scdl:/config
