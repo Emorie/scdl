@@ -178,6 +178,7 @@ services:
   scdl-web:
     build: .
     container_name: scdl_web
+    command: uvicorn scdl_web.main:app --host 0.0.0.0 --port 8090
     ports:
       - "8090:8090"
     environment:

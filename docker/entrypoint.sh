@@ -25,4 +25,8 @@ fi
 
 chown "$PUID:$PGID" "$DOWNLOAD_DIR" "$CONFIG_DIR" "$CONFIG_DIR/logs" "$CONFIG_DIR/archive.txt" 2>/dev/null || true
 
+if [ "$#" -eq 1 ]; then
+  set -- $1
+fi
+
 exec gosu "$PUID:$PGID" "$@"
