@@ -5,6 +5,8 @@ const state = {
   qualityRawVisible: false,
   historyPage: 1,
   historyTotal: 0,
+  urlInfo: null,
+  urlInspectTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -52,8 +54,25 @@ function currentUrls() {
   return $("url-input").value.trim();
 }
 
+function firstUrl() {
+  return currentUrls().split(/\s+/).filter(Boolean)[0] || "";
+}
+
 function archiveForDownload() {
   return $("archive-for-download").checked;
+}
+
+function profileTypeLabels() {
+  return Object.fromEntries(
+    Object.entries(state.settings.profile_download_types || {}).map(([value, config]) => [
+      value,
+      typeof config === "string" ? config : config.label || value,
+    ]),
+  );
+}
+
+function currentProfileType() {
+  return $("profile-type").value || state.urlInfo?.default_profile_type || state.settings.default_profile_download_type || "uploads";
 }
 
 function renderPresets() {
@@ -71,13 +90,73 @@ function renderPresets() {
 
 function fillSelect(select, values, selected) {
   select.innerHTML = "";
-  Object.entries(values || {}).forEach(([value, label]) => {
+  Object.entries(values || {}).forEach(([value, labelConfig]) => {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = label;
+    option.textContent = typeof labelConfig === "string" ? labelConfig : labelConfig.label || value;
     select.appendChild(option);
   });
   select.value = selected;
+}
+
+function renderUrlInfo(info = state.urlInfo, resetProfile = false) {
+  const badge = $("url-type-badge");
+  const helper = $("url-helper");
+  const profileField = $("profile-type-field");
+  const profileSelect = $("profile-type");
+  const profileLabels = profileTypeLabels();
+  const selectedProfile = resetProfile
+    ? info?.default_profile_type || state.settings.default_profile_download_type || "uploads"
+    : profileSelect.value || info?.default_profile_type || state.settings.default_profile_download_type || "uploads";
+  fillSelect(profileSelect, profileLabels, selectedProfile);
+
+  if (!firstUrl()) {
+    badge.textContent = "No URL";
+    badge.className = "pill neutral";
+    helper.textContent = "Paste a SoundCloud track, playlist, or profile URL.";
+    profileField.classList.add("hidden");
+    return;
+  }
+
+  if (!info || !info.valid) {
+    badge.textContent = "Unknown";
+    badge.className = "pill bad";
+    helper.textContent = info?.message || "Please paste a valid SoundCloud URL.";
+    profileField.classList.add("hidden");
+    return;
+  }
+
+  badge.textContent = info.label || "SoundCloud";
+  badge.className = info.is_profile ? "pill warn" : info.is_track ? "pill ok" : "pill neutral";
+  helper.textContent = info.message || "";
+  profileField.classList.toggle("hidden", !info.is_profile);
+}
+
+async function inspectCurrentUrl() {
+  const url = firstUrl();
+  if (!url) {
+    state.urlInfo = null;
+    renderUrlInfo(null);
+    return null;
+  }
+  try {
+    const info = await api("/api/url-info", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+    state.urlInfo = info;
+    renderUrlInfo(info, true);
+    return info;
+  } catch (error) {
+    state.urlInfo = { valid: false, message: error.message };
+    renderUrlInfo(state.urlInfo);
+    return state.urlInfo;
+  }
+}
+
+function scheduleUrlInspect() {
+  clearTimeout(state.urlInspectTimer);
+  state.urlInspectTimer = setTimeout(() => inspectCurrentUrl().catch(() => {}), 220);
 }
 
 function renderOrganizationPreview(settings) {
@@ -93,7 +172,12 @@ function previewForMode(mode, fallback = []) {
     "by-playlist": ["Playlists/Beat Tape/001 - Artist - Track.opus", "Singles/Artist - Track.mp3"],
     "by-source-type": ["Likes/J Dilla/Song Title.flac", "Playlists/Beat Tape/001 - Artist - Track.opus", "Singles/Artist/Track.mp3"],
     "scdl-default": ["scdl chooses the original output folders and filenames"],
-    "library-clean": ["Likes/J Dilla/Song Title.flac", "Playlists/Beat Tape/001 - Artist - Track.opus", "Artists/Artist/Track.mp3"],
+    "library-clean": [
+      "Likes/J Dilla/Song Title.flac",
+      "Playlists/Beat Tape/001 - Artist - Track.opus",
+      "Artists/Artist/Track.mp3",
+      "Profiles/Profile Name/Uploads/Track Title.m4a",
+    ],
   };
   return previews[mode] || fallback;
 }
@@ -111,6 +195,7 @@ function renderPresetPanel() {
   } else {
     $("url-input").placeholder = "https://soundcloud.com/artist/track\nhttps://soundcloud.com/artist/sets/playlist";
   }
+  renderUrlInfo();
 }
 
 function renderSettings() {
@@ -126,6 +211,9 @@ function renderSettings() {
   $("playlist-format").value = settings.playlist_name_format || "";
   $("max-concurrent").value = settings.max_concurrent_downloads || 1;
   $("download-delay").value = settings.download_delay_seconds ?? 2;
+  $("max-rate-backoff").value = settings.max_rate_limit_backoff_seconds ?? 900;
+  $("max-consecutive-rate-limits").value = settings.max_consecutive_rate_limits ?? 8;
+  fillSelect($("default-profile-type"), profileTypeLabels(), settings.default_profile_download_type || "uploads");
   $("original-art").checked = !!settings.original_art;
   $("add-description").checked = !!settings.add_description;
   fillSelect($("artist-priority"), settings.artist_priority_modes, settings.artist_metadata_priority || "smart-auto");
@@ -145,6 +233,7 @@ function renderSettings() {
   renderOrganizationPreview(settings);
   $("auth-status-badge").textContent = settings.auth_configured ? `Auth: ${settings.auth_source}` : "Auth missing";
   $("auth-status-badge").className = settings.auth_configured ? "pill ok" : "pill warn";
+  renderUrlInfo();
 }
 
 function statusClass(status) {
@@ -156,7 +245,7 @@ function badgeForStatus(status) {
   let className = "neutral";
   if (normalized === "running" || normalized === "done") className = "ok";
   if (normalized === "failed" || normalized === "cancelled") className = "bad";
-  if (normalized === "skipped") className = "warn";
+  if (normalized === "skipped" || normalized.includes("rate limited")) className = "warn";
   return `<span class="pill ${className}">${escapeHtml(status)}</span>`;
 }
 
@@ -175,8 +264,9 @@ function qualityBadge(label) {
 
 function renderQueue(queue) {
   state.queue = queue;
-  $("queue-pill").textContent = queue.paused ? "Queue paused" : "Queue active";
-  $("queue-pill").className = queue.paused ? "pill neutral" : "pill ok";
+  const rateLimited = queue.items.find((item) => String(item.status).toLowerCase().includes("rate limited"));
+  $("queue-pill").textContent = rateLimited ? "Paused - rate limited" : queue.paused ? "Queue paused" : "Queue active";
+  $("queue-pill").className = rateLimited ? "pill warn" : queue.paused ? "pill neutral" : "pill ok";
   const list = $("queue-list");
   if (!queue.items.length) {
     list.className = "queue-list empty-state";
@@ -192,7 +282,8 @@ function renderQueue(queue) {
 function renderLikesCurrent(queue) {
   const running = queue.items.find((item) => item.is_likes_sync && item.status === "Running");
   const pending = queue.items.find((item) => item.is_likes_sync && item.status === "Pending");
-  const item = running || pending;
+  const rateLimited = queue.items.find((item) => item.is_likes_sync && String(item.status).toLowerCase().includes("rate limited"));
+  const item = running || pending || rateLimited;
   const node = $("likes-current");
   if (!item) {
     node.className = "mini-log empty-state";
@@ -211,27 +302,42 @@ function renderQueueItem(item) {
     .map((file) => `<span class="quality-badge neutral">${escapeHtml(file.name)} | ${escapeHtml(file.size_label)}</span>`)
     .join("");
   const command = (item.command || []).join(" ");
-  const canRetry = ["Failed", "Cancelled", "Skipped", "Done"].includes(item.status);
+  const isRateLimited = String(item.status).toLowerCase().includes("rate limited");
+  const canRetry = ["Failed", "Cancelled", "Skipped", "Done"].includes(item.status) || isRateLimited;
   const canCancel = ["Pending", "Running"].includes(item.status);
+  const jobType = item.job_type || item.preset_name;
+  const retryAt = item.rate_limit_retry_at ? `Safe to resume after ${item.rate_limit_retry_at}.` : "Try again later; archive will skip completed tracks.";
+  const rateLimitNote = isRateLimited
+    ? `<div class="rate-limit-note">
+        <strong>SoundCloud rate-limited this job.</strong>
+        <span>${escapeHtml(retryAt)}</span>
+        ${item.last_rate_limit_backoff ? `<span>Current capped backoff: ${escapeHtml(item.last_rate_limit_backoff)}s.</span>` : ""}
+      </div>`
+    : "";
   return `
     <article class="queue-item ${statusClass(item.status)}" data-id="${escapeHtml(item.id)}">
       <div class="queue-head">
         <div class="queue-title">
-          <strong>${escapeHtml(item.preset_name)}</strong>
+          <strong>${escapeHtml(jobType)}</strong>
           <span>${escapeHtml(item.target)}</span>
+          <span>${escapeHtml(item.url_kind || "download")}${item.profile_type ? ` / ${escapeHtml(item.profile_type)}` : ""}</span>
         </div>
         <div class="queue-actions">
           ${badgeForStatus(item.status)}
-          ${canRetry ? `<button class="small-button retry-item" data-id="${escapeHtml(item.id)}" type="button">Retry</button>` : ""}
+          ${isRateLimited ? `<button class="small-button resume-later" data-id="${escapeHtml(item.id)}" type="button">Resume Later</button>` : ""}
+          ${canRetry ? `<button class="small-button retry-item" data-id="${escapeHtml(item.id)}" type="button">${isRateLimited ? "Retry Now" : "Retry"}</button>` : ""}
+          ${isRateLimited ? `<button class="danger-button cancel-item" data-id="${escapeHtml(item.id)}" type="button">Stop Job</button>` : ""}
           ${canCancel ? `<button class="danger-button cancel-item" data-id="${escapeHtml(item.id)}" type="button">Cancel</button>` : ""}
         </div>
       </div>
       <div class="progress-shell"><div class="progress-bar"></div></div>
+      ${rateLimitNote}
       <div class="summary-grid">${badges}${files}</div>
       ${metadata.title ? `<p class="metadata-line">${escapeHtml(metadata.artist || metadata.uploader || "Unknown Artist")} - ${escapeHtml(metadata.title)}</p>` : ""}
       <details>
         <summary>Logs and command</summary>
         <pre class="log-view">${escapeHtml(command + "\n\n" + (item.logs || []).join("\n"))}</pre>
+        <button class="small-button copy-command" data-id="${escapeHtml(item.id)}" type="button">Copy Command</button>
         <button class="small-button copy-logs" data-id="${escapeHtml(item.id)}" type="button">Copy Logs</button>
       </details>
     </article>
@@ -331,6 +437,7 @@ function renderStats(data) {
   $("stat-downloaded").textContent = data.downloaded ?? 0;
   $("stat-skipped").textContent = data.skipped ?? 0;
   $("stat-failed").textContent = data.failed ?? 0;
+  $("stat-rate-limited").textContent = data.rate_limited ?? 0;
   $("stat-remaining").textContent = data.remaining_unknown ?? 0;
   const failures = data.recent_failures || [];
   const failureNode = $("recent-failures");
@@ -345,7 +452,7 @@ function renderStats(data) {
       (item) => `
         <div class="history-row">
           <div>
-            <strong>${escapeHtml(item.preset_name)}</strong>
+            <strong>${escapeHtml(item.job_type || item.preset_name)}</strong>
             <span>${escapeHtml(item.target_url || item.target)}</span>
             ${item.last_error ? `<span>${escapeHtml(item.last_error)}</span>` : ""}
           </div>
@@ -374,7 +481,7 @@ function renderHistory(data) {
       const metadata = item.metadata_records?.[0] || {};
       const headline = metadata.title
         ? `${metadata.artist || metadata.uploader || "Unknown Artist"} - ${metadata.title}`
-        : item.preset_name;
+        : item.job_type || item.preset_name;
       const tagLine = [metadata.genre, ...(metadata.tags || []).slice(0, 5)].filter(Boolean).join(", ");
       return `
         <div class="history-row">
@@ -423,6 +530,10 @@ async function addToQueue(autostart = false) {
     await checkQualities();
     return;
   }
+  const info = await inspectCurrentUrl();
+  if (info?.is_profile && !$("profile-type").value) {
+    throw new Error("Profile URLs require a download type. Choose Uploads, All Tracks + Reposts, Likes, Playlists, or Reposts.");
+  }
   const data = await api("/api/queue", {
     method: "POST",
     body: JSON.stringify({
@@ -430,6 +541,7 @@ async function addToQueue(autostart = false) {
       preset,
       autostart,
       archive_enabled: archiveForDownload(),
+      profile_type: info?.is_profile ? currentProfileType() : null,
     }),
   });
   renderQueue(data.queue);
@@ -439,6 +551,10 @@ async function addToQueue(autostart = false) {
 async function checkQualities() {
   const urls = currentUrls().split(/\s+/).filter(Boolean);
   if (!urls.length) throw new Error("Paste a SoundCloud URL first");
+  const info = await inspectCurrentUrl();
+  if (!info?.is_track) {
+    throw new Error("Check Qualities is for individual track URLs. For profiles, choose a profile download type and start a download.");
+  }
   $("check-button").disabled = true;
   $("quality-status").textContent = "Checking";
   $("quality-status").className = "pill warn";
@@ -481,6 +597,9 @@ async function saveSettings(clearToken = false, options = {}) {
     include_upload_date_in_filename: $("include-upload-date").checked,
     max_concurrent_downloads: Number($("max-concurrent").value || 1),
     download_delay_seconds: Number($("download-delay").value || 0),
+    max_rate_limit_backoff_seconds: Number($("max-rate-backoff").value || 900),
+    max_consecutive_rate_limits: Number($("max-consecutive-rate-limits").value || 8),
+    default_profile_download_type: $("default-profile-type").value,
     default_preset: selectedPreset(),
   };
   state.settings = await api("/api/settings", {
@@ -536,7 +655,12 @@ function confirmModal(title, message, onConfirm) {
 }
 
 function wireEvents() {
-  $("preset-select").addEventListener("change", renderPresetPanel);
+  $("preset-select").addEventListener("change", () => {
+    renderPresetPanel();
+    inspectCurrentUrl().catch(() => {});
+  });
+  $("url-input").addEventListener("input", scheduleUrlInspect);
+  $("profile-type").addEventListener("change", () => renderUrlInfo());
   $("check-button").addEventListener("click", () => checkQualities().catch((error) => toast("Quality check failed", error.message, "bad")));
   $("add-button").addEventListener("click", () => addToQueue(false).catch((error) => toast("Could not add", error.message, "bad")));
   $("start-download-button").addEventListener("click", () => addToQueue(true).catch((error) => toast("Could not start", error.message, "bad")));
@@ -626,6 +750,7 @@ function wireEvents() {
   $("paste-button").addEventListener("click", async () => {
     try {
       $("url-input").value = await navigator.clipboard.readText();
+      await inspectCurrentUrl();
     } catch {
       toast("Clipboard unavailable", "Browser permission was not granted.", "bad");
     }
@@ -640,11 +765,22 @@ function wireEvents() {
     const retry = event.target.closest(".retry-item");
     const cancel = event.target.closest(".cancel-item");
     const copy = event.target.closest(".copy-logs");
+    const copyCommand = event.target.closest(".copy-command");
+    const resumeLater = event.target.closest(".resume-later");
     if (retry) {
       renderQueue(await api(`/api/queue/${retry.dataset.id}/retry`, { method: "POST", body: "{}" }));
     }
     if (cancel) {
       renderQueue(await api(`/api/queue/${cancel.dataset.id}/cancel`, { method: "POST", body: "{}" }));
+    }
+    if (resumeLater) {
+      renderQueue(await api("/api/queue/pause", { method: "POST", body: "{}" }));
+      toast("Paused safely", "Resume later will reuse archive and history.", "ok");
+    }
+    if (copyCommand) {
+      const item = state.queue.items.find((queueItem) => queueItem.id === copyCommand.dataset.id);
+      await navigator.clipboard.writeText((item?.command || []).join(" "));
+      toast("Command copied", "Auth token is masked.", "ok");
     }
     if (copy) {
       const item = state.queue.items.find((queueItem) => queueItem.id === copy.dataset.id);

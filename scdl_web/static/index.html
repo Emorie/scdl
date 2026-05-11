@@ -39,11 +39,19 @@
                 placeholder="https://soundcloud.com/artist/track&#10;https://soundcloud.com/artist/sets/playlist"
               ></textarea>
             </label>
+            <div class="url-inspector">
+              <span id="url-type-badge" class="pill neutral">No URL</span>
+              <span id="url-helper">Paste a SoundCloud track, playlist, or profile URL.</span>
+            </div>
 
             <div class="form-grid">
               <label class="field">
                 <span>Preset</span>
                 <select id="preset-select"></select>
+              </label>
+              <label id="profile-type-field" class="field hidden">
+                <span>Profile download type</span>
+                <select id="profile-type"></select>
               </label>
               <label class="field inline-check">
                 <input id="archive-for-download" type="checkbox" checked />
@@ -74,6 +82,13 @@
               <span class="quality-badge skipped">Already downloaded</span>
               <span class="quality-badge failed">Failed</span>
             </div>
+            <div class="helper-list">
+              <strong>What should I use?</strong>
+              <span>Single song: Best Original Available</span>
+              <span>Playlist: Best Original Available</span>
+              <span>Someone else's profile tracks: Profile Uploads / Tracks</span>
+              <span>Your own likes: My Likes Sync</span>
+            </div>
           </section>
 
           <section class="panel likes-panel">
@@ -92,6 +107,7 @@
               <div><strong id="stat-downloaded">0</strong><span>Downloaded</span></div>
               <div><strong id="stat-skipped">0</strong><span>Skipped</span></div>
               <div><strong id="stat-failed">0</strong><span>Failed</span></div>
+              <div><strong id="stat-rate-limited">0</strong><span>Rate limited</span></div>
               <div><strong id="stat-remaining">0</strong><span>Remaining</span></div>
             </div>
             <div class="action-row">
@@ -162,6 +178,18 @@
               <label class="field">
                 <span>Delay between downloads</span>
                 <input id="download-delay" type="number" min="0" step="0.5" />
+              </label>
+              <label class="field">
+                <span>Max rate-limit backoff seconds</span>
+                <input id="max-rate-backoff" type="number" min="1" step="1" />
+              </label>
+              <label class="field">
+                <span>Max consecutive rate limits</span>
+                <input id="max-consecutive-rate-limits" type="number" min="1" step="1" />
+              </label>
+              <label class="field">
+                <span>Default profile download type</span>
+                <select id="default-profile-type"></select>
               </label>
               <div class="toggle-list">
                 <label><input id="archive-enabled" type="checkbox" /> Archive by default</label>
@@ -268,6 +296,7 @@
                 <option>All</option>
                 <option>Downloaded</option>
                 <option>Failed</option>
+                <option>Rate Limited</option>
                 <option>Skipped</option>
                 <option>Pending</option>
               </select>

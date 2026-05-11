@@ -37,7 +37,9 @@ MAX_LOG_LINES = 1200
 RECENT_FILE_LIMIT = 100
 ARCHIVE_IMPORT_LIMIT = 5 * 1024 * 1024
 ACTIVE_STATUSES = {"Pending", "Running"}
-TERMINAL_STATUSES = {"Done", "Failed", "Skipped", "Cancelled"}
+RATE_LIMITED_STATUS = "Paused - Rate Limited"
+TERMINAL_STATUSES = {"Done", "Skipped", "Cancelled"}
+RETRYABLE_STATUSES = {"Failed", "Skipped", "Cancelled", RATE_LIMITED_STATUS}
 AUDIO_EXTENSIONS = {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 RELATED_FILE_EXTENSIONS = {".jpeg", ".jpg", ".png", ".txt"}
 MEDIA_EXTENSIONS = {
@@ -68,6 +70,21 @@ ARTIST_PRIORITY_MODES = {
     "uploader-first": "Uploader First",
     "tagged-first": "Tagged Metadata First",
     "title-parse-first": "Title Parse First",
+}
+PROFILE_DOWNLOAD_TYPES = {
+    "uploads": {"label": "Uploads only", "flag": "-t", "job_type": "Profile Uploads"},
+    "all": {"label": "All tracks + reposts", "flag": "-a", "job_type": "Profile All Tracks + Reposts"},
+    "likes": {"label": "Likes/favorites", "flag": "-f", "job_type": "Profile Likes"},
+    "playlists": {"label": "Playlists", "flag": "-p", "job_type": "Profile Playlists"},
+    "reposts": {"label": "Reposts", "flag": "-r", "job_type": "Profile Reposts"},
+}
+PROFILE_PATH_DEFAULTS = {
+    "tracks": "uploads",
+    "popular-tracks": "uploads",
+    "albums": "playlists",
+    "sets": "playlists",
+    "reposts": "reposts",
+    "likes": "likes",
 }
 
 
@@ -110,6 +127,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "include_upload_date_in_filename": False,
     "max_concurrent_downloads": env_int("MAX_CONCURRENT_DOWNLOADS", 1),
     "download_delay_seconds": env_float("DOWNLOAD_DELAY_SECONDS", 2),
+    "max_rate_limit_backoff_seconds": env_int("MAX_RATE_LIMIT_BACKOFF_SECONDS", 900),
+    "max_consecutive_rate_limits": env_int("MAX_CONSECUTIVE_RATE_LIMITS", 8),
+    "default_profile_download_type": os.environ.get("DEFAULT_PROFILE_DOWNLOAD_TYPE", "uploads"),
     "default_preset": os.environ.get("DEFAULT_PRESET", "best-original"),
 }
 
@@ -175,6 +195,12 @@ PRESETS: dict[str, Preset] = {
         "Repairs metadata for existing files where possible.",
         ("-l", "{url}", "--force-metadata"),
     ),
+    "profile-uploads": Preset(
+        "profile-uploads",
+        "Profile Uploads / Tracks",
+        "Downloads a SoundCloud profile's uploads/tracks with best-quality mode.",
+        ("-l", "{url}", "--best-quality"),
+    ),
 }
 
 
@@ -183,9 +209,14 @@ class QueueAddRequest(BaseModel):
     preset: str = "best-original"
     autostart: bool = False
     archive_enabled: Optional[bool] = None
+    profile_type: Optional[str] = None
 
 
 class QualityRequest(BaseModel):
+    url: str
+
+
+class UrlInfoRequest(BaseModel):
     url: str
 
 
@@ -215,6 +246,9 @@ class SettingsUpdate(BaseModel):
     include_upload_date_in_filename: Optional[bool] = None
     max_concurrent_downloads: Optional[int] = None
     download_delay_seconds: Optional[float] = None
+    max_rate_limit_backoff_seconds: Optional[int] = None
+    max_consecutive_rate_limits: Optional[int] = None
+    default_profile_download_type: Optional[str] = None
     default_preset: Optional[str] = None
 
 
@@ -229,6 +263,9 @@ class QueueItem:
     preset_name: str
     target: str
     target_url: str
+    url_kind: str
+    profile_type: Optional[str]
+    job_type: str
     command: list[str]
     masked_command: list[str]
     log_path: Path
@@ -243,12 +280,16 @@ class QueueItem:
     output_file: Optional[str] = None
     track_id: Optional[str] = None
     last_error: Optional[str] = None
+    rate_limit_count: int = 0
+    last_rate_limit_backoff: Optional[int] = None
+    rate_limit_retry_at: Optional[float] = None
     logs: list[str] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
     metadata_records: list[dict[str, Any]] = field(default_factory=list)
     process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     task: Optional[asyncio.Task] = field(default=None, repr=False)
+    rate_limit_pause_requested: bool = field(default=False, repr=False)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -257,6 +298,9 @@ class QueueItem:
             "preset_name": self.preset_name,
             "target": self.target,
             "target_url": self.target_url,
+            "url_kind": self.url_kind,
+            "profile_type": self.profile_type,
+            "job_type": self.job_type,
             "command": self.masked_command,
             "archive_enabled": self.archive_enabled,
             "is_likes_sync": self.is_likes_sync,
@@ -269,6 +313,9 @@ class QueueItem:
             "output_file": self.output_file,
             "track_id": self.track_id,
             "last_error": self.last_error,
+            "rate_limit_count": self.rate_limit_count,
+            "last_rate_limit_backoff": self.last_rate_limit_backoff,
+            "rate_limit_retry_at": iso_time(self.rate_limit_retry_at),
             "logs": self.logs[-200:],
             "log_path": str(self.log_path),
             "files": self.files,
@@ -297,6 +344,12 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def ensure_queue_column(conn: sqlite3.Connection, name: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(queue_items)").fetchall()}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE queue_items ADD COLUMN {name} {definition}")
+
+
 def init_db() -> None:
     with db_connect() as conn:
         conn.execute(
@@ -307,6 +360,9 @@ def init_db() -> None:
                 preset_name TEXT NOT NULL,
                 target TEXT NOT NULL,
                 target_url TEXT NOT NULL DEFAULT '',
+                url_kind TEXT NOT NULL DEFAULT 'unknown',
+                profile_type TEXT,
+                job_type TEXT NOT NULL DEFAULT 'Download',
                 status TEXT NOT NULL,
                 archive_enabled INTEGER NOT NULL DEFAULT 1,
                 is_likes_sync INTEGER NOT NULL DEFAULT 0,
@@ -320,10 +376,19 @@ def init_db() -> None:
                 summary_json TEXT NOT NULL DEFAULT '{}',
                 output_file TEXT,
                 track_id TEXT,
-                last_error TEXT
+                last_error TEXT,
+                rate_limit_count INTEGER NOT NULL DEFAULT 0,
+                last_rate_limit_backoff INTEGER,
+                rate_limit_retry_at REAL
             )
             """,
         )
+        ensure_queue_column(conn, "url_kind", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_queue_column(conn, "profile_type", "TEXT")
+        ensure_queue_column(conn, "job_type", "TEXT NOT NULL DEFAULT 'Download'")
+        ensure_queue_column(conn, "rate_limit_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_queue_column(conn, "last_rate_limit_backoff", "INTEGER")
+        ensure_queue_column(conn, "rate_limit_retry_at", "REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue_items(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_updated ON queue_items(updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_likes ON queue_items(is_likes_sync, status)")
@@ -535,6 +600,7 @@ def row_to_item(row: sqlite3.Row) -> QueueItem:
             preset_id,
             target_url,
             archive_enabled=bool(row["archive_enabled"]),
+            profile_type=row["profile_type"],
         )
     except HTTPException:
         command, masked, archive_enabled = [], [], bool(row["archive_enabled"])
@@ -544,6 +610,9 @@ def row_to_item(row: sqlite3.Row) -> QueueItem:
         preset_name=row["preset_name"],
         target=row["target"],
         target_url=target_url,
+        url_kind=row["url_kind"],
+        profile_type=row["profile_type"],
+        job_type=row["job_type"],
         command=command,
         masked_command=masked,
         archive_enabled=archive_enabled,
@@ -557,6 +626,9 @@ def row_to_item(row: sqlite3.Row) -> QueueItem:
         output_file=row["output_file"],
         track_id=row["track_id"],
         last_error=row["last_error"],
+        rate_limit_count=int(row["rate_limit_count"] or 0),
+        last_rate_limit_backoff=row["last_rate_limit_backoff"],
+        rate_limit_retry_at=row["rate_limit_retry_at"],
         log_path=Path(row["log_path"] or LOG_DIR / f"{row['id']}.log"),
         files=json_loads(row["files_json"], []),
         summary=json_loads(row["summary_json"], {}),
@@ -569,17 +641,22 @@ def persist_item(item: QueueItem) -> None:
         conn.execute(
             """
             INSERT INTO queue_items (
-                id, preset_id, preset_name, target, target_url, status, archive_enabled,
+                id, preset_id, preset_name, target, target_url, url_kind, profile_type,
+                job_type, status, archive_enabled,
                 is_likes_sync, created_at, updated_at, started_at, finished_at,
                 return_code, log_path, files_json, summary_json, output_file,
-                track_id, last_error
+                track_id, last_error, rate_limit_count, last_rate_limit_backoff,
+                rate_limit_retry_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 preset_id = excluded.preset_id,
                 preset_name = excluded.preset_name,
                 target = excluded.target,
                 target_url = excluded.target_url,
+                url_kind = excluded.url_kind,
+                profile_type = excluded.profile_type,
+                job_type = excluded.job_type,
                 status = excluded.status,
                 archive_enabled = excluded.archive_enabled,
                 is_likes_sync = excluded.is_likes_sync,
@@ -592,7 +669,10 @@ def persist_item(item: QueueItem) -> None:
                 summary_json = excluded.summary_json,
                 output_file = excluded.output_file,
                 track_id = excluded.track_id,
-                last_error = excluded.last_error
+                last_error = excluded.last_error,
+                rate_limit_count = excluded.rate_limit_count,
+                last_rate_limit_backoff = excluded.last_rate_limit_backoff,
+                rate_limit_retry_at = excluded.rate_limit_retry_at
             """,
             (
                 item.id,
@@ -600,6 +680,9 @@ def persist_item(item: QueueItem) -> None:
                 item.preset_name,
                 item.target,
                 item.target_url,
+                item.url_kind,
+                item.profile_type,
+                item.job_type,
                 item.status,
                 int(item.archive_enabled),
                 int(item.is_likes_sync),
@@ -614,6 +697,9 @@ def persist_item(item: QueueItem) -> None:
                 item.output_file,
                 item.track_id,
                 item.last_error,
+                item.rate_limit_count,
+                item.last_rate_limit_backoff,
+                item.rate_limit_retry_at,
             ),
         )
         conn.commit()
@@ -625,9 +711,10 @@ def load_active_items() -> list[QueueItem]:
         rows = conn.execute(
             """
             SELECT * FROM queue_items
-            WHERE status IN ('Pending', 'Running')
+            WHERE status IN ('Pending', 'Running', ?)
             ORDER BY created_at ASC
             """,
+            (RATE_LIMITED_STATUS,),
         ).fetchall()
     return [row_to_item(row) for row in rows]
 
@@ -638,6 +725,8 @@ def history_status_filter(status: str) -> tuple[str, list[Any]]:
         return "status = ?", ["Done"]
     if normalized in {"failed", "skipped", "pending", "running", "cancelled"}:
         return "status = ?", [normalized.title()]
+    if normalized in {"rate limited", "rate-limited", "paused - rate limited"}:
+        return "status = ?", [RATE_LIMITED_STATUS]
     if normalized == "remaining":
         return "status IN ('Pending', 'Running')", []
     return "1 = 1", []
@@ -697,6 +786,9 @@ def history_row_public(row: sqlite3.Row) -> dict[str, Any]:
         "preset_name": row["preset_name"],
         "target": row["target"],
         "target_url": row["target_url"],
+        "url_kind": row["url_kind"],
+        "profile_type": row["profile_type"],
+        "job_type": row["job_type"],
         "status": row["status"],
         "archive_enabled": bool(row["archive_enabled"]),
         "is_likes_sync": bool(row["is_likes_sync"]),
@@ -708,6 +800,9 @@ def history_row_public(row: sqlite3.Row) -> dict[str, Any]:
         "output_file": row["output_file"],
         "track_id": row["track_id"],
         "last_error": row["last_error"],
+        "rate_limit_count": row["rate_limit_count"],
+        "last_rate_limit_backoff": row["last_rate_limit_backoff"],
+        "rate_limit_retry_at": iso_time(row["rate_limit_retry_at"]),
         "summary": json_loads(row["summary_json"], {}),
         "metadata_records": metadata_for_queue(row["id"], limit=8),
     }
@@ -730,10 +825,11 @@ def app_stats() -> dict[str, Any]:
         recent_failures = conn.execute(
             """
             SELECT * FROM queue_items
-            WHERE status = 'Failed'
+            WHERE status IN ('Failed', ?)
             ORDER BY updated_at DESC
             LIMIT 5
             """,
+            (RATE_LIMITED_STATUS,),
         ).fetchall()
     counts = {row["status"]: row["count"] for row in rows}
     downloaded = counts.get("Done", 0)
@@ -741,6 +837,7 @@ def app_stats() -> dict[str, Any]:
     skipped = counts.get("Skipped", 0)
     pending = counts.get("Pending", 0)
     running = counts.get("Running", 0)
+    rate_limited = counts.get(RATE_LIMITED_STATUS, 0)
     return {
         "history_count": history_count,
         "metadata_count": metadata_count,
@@ -751,21 +848,23 @@ def app_stats() -> dict[str, Any]:
         "skipped": skipped,
         "pending": pending,
         "running": running,
+        "rate_limited": rate_limited,
         "remaining_unknown": pending + running,
         "latest_likes_sync": history_row_public(likes) if likes else None,
         "recent_failures": [history_row_public(row) for row in recent_failures],
     }
 
 
-def failed_likes_items() -> list[QueueItem]:
+def retryable_likes_items() -> list[QueueItem]:
     init_db()
     with db_connect() as conn:
         rows = conn.execute(
             """
             SELECT * FROM queue_items
-            WHERE is_likes_sync = 1 AND status = 'Failed'
+            WHERE is_likes_sync = 1 AND status IN ('Failed', ?)
             ORDER BY updated_at ASC
             """,
+            (RATE_LIMITED_STATUS,),
         ).fetchall()
     return [row_to_item(row) for row in rows]
 
@@ -798,6 +897,16 @@ def load_settings() -> dict[str, Any]:
         settings["download_delay_seconds"] = max(0.0, float(settings.get("download_delay_seconds") or 0))
     except (TypeError, ValueError):
         settings["download_delay_seconds"] = 2
+    try:
+        settings["max_rate_limit_backoff_seconds"] = max(1, int(settings.get("max_rate_limit_backoff_seconds") or 900))
+    except (TypeError, ValueError):
+        settings["max_rate_limit_backoff_seconds"] = 900
+    try:
+        settings["max_consecutive_rate_limits"] = max(1, int(settings.get("max_consecutive_rate_limits") or 8))
+    except (TypeError, ValueError):
+        settings["max_consecutive_rate_limits"] = 8
+    if settings.get("default_profile_download_type") not in PROFILE_DOWNLOAD_TYPES:
+        settings["default_profile_download_type"] = "uploads"
     save_settings(settings)
     return settings
 
@@ -827,6 +936,7 @@ def public_settings() -> dict[str, Any]:
             "logs_dir": str(LOG_DIR),
             "organization_modes": ORGANIZATION_MODES,
             "artist_priority_modes": ARTIST_PRIORITY_MODES,
+            "profile_download_types": PROFILE_DOWNLOAD_TYPES,
             "organization_preview": organization_preview(settings),
         },
     )
@@ -844,6 +954,117 @@ def split_urls(value: str | list[str]) -> list[str]:
     else:
         raw_parts = re.split(r"[\s,]+", value.strip())
     return [part.strip() for part in raw_parts if part and part.strip()]
+
+
+def soundcloud_path_parts(url: str) -> list[str]:
+    parsed = urlparse(url)
+    return [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+
+
+def classify_soundcloud_url(raw_url: str) -> dict[str, Any]:
+    try:
+        url = validate_soundcloud_url(raw_url)
+    except HTTPException as exc:
+        return {
+            "valid": False,
+            "url": raw_url,
+            "kind": "invalid",
+            "label": "Unknown",
+            "message": str(exc.detail),
+            "default_profile_type": None,
+            "is_track": False,
+            "is_playlist": False,
+            "is_profile": False,
+        }
+    parts = soundcloud_path_parts(url)
+    kind = "unknown"
+    label = "Unknown"
+    message = "Please paste a valid SoundCloud URL."
+    default_profile_type = None
+    if len(parts) >= 3 and parts[1] == "sets":
+        kind = "playlist"
+        label = "Playlist"
+        message = "Playlist detected. Playlist downloads will use playlist folder formatting."
+    elif len(parts) == 1:
+        kind = "profile"
+        label = "Profile"
+        default_profile_type = "uploads"
+        message = "Profile detected. Choose what to download."
+    elif len(parts) == 2 and parts[1] in PROFILE_PATH_DEFAULTS:
+        default_profile_type = PROFILE_PATH_DEFAULTS[parts[1]]
+        kind = {
+            "tracks": "profile-tracks",
+            "popular-tracks": "profile-tracks",
+            "likes": "profile-likes",
+            "sets": "profile-sets",
+            "albums": "profile-sets",
+            "reposts": "profile-reposts",
+        }.get(parts[1], "profile")
+        label = {
+            "profile-tracks": "Profile uploads",
+            "profile-likes": "Profile likes",
+            "profile-sets": "Profile playlists",
+            "profile-reposts": "Profile reposts",
+        }.get(kind, "Profile")
+        message = "Profile detected. Choose what to download."
+    elif len(parts) >= 2:
+        kind = "track"
+        label = "Track"
+        message = "Track detected."
+    return {
+        "valid": kind != "unknown",
+        "url": url,
+        "kind": kind,
+        "label": label,
+        "message": message,
+        "default_profile_type": default_profile_type,
+        "profile_types": PROFILE_DOWNLOAD_TYPES,
+        "is_track": kind == "track",
+        "is_playlist": kind == "playlist",
+        "is_profile": kind.startswith("profile"),
+    }
+
+
+def normalize_profile_type(profile_type: Optional[str], url_info: dict[str, Any], settings: dict[str, Any]) -> Optional[str]:
+    if not url_info.get("is_profile"):
+        return None
+    selected = profile_type or url_info.get("default_profile_type") or settings.get("default_profile_download_type") or "uploads"
+    selected = str(selected or "").strip()
+    if selected not in PROFILE_DOWNLOAD_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Profile URLs require a download type. Choose Uploads, All Tracks + Reposts, Likes, Playlists, or Reposts.",
+        )
+    return selected
+
+
+def job_type_for(preset: Preset, target: str, url_info: dict[str, Any], profile_type: Optional[str]) -> str:
+    if preset.id == "likes-best":
+        return "My Likes Sync"
+    if profile_type:
+        return str(PROFILE_DOWNLOAD_TYPES[profile_type]["job_type"])
+    if url_info.get("kind") == "track":
+        return "Track"
+    if url_info.get("kind") == "playlist":
+        return "Playlist"
+    return preset.name
+
+
+def job_context(preset: Preset, target: str, profile_type: Optional[str]) -> dict[str, Any]:
+    if not preset.needs_url:
+        return {"url_kind": "me-likes", "profile_type": None, "job_type": "My Likes Sync"}
+    normalized = validate_soundcloud_url(target)
+    info = classify_soundcloud_url(normalized)
+    if preset.id == "profile-uploads" and not info.get("is_profile"):
+        raise HTTPException(status_code=400, detail="Profile Uploads / Tracks is for SoundCloud profile URLs.")
+    selected_profile_type = normalize_profile_type(profile_type, info, load_settings())
+    if preset.id == "profile-uploads" and info.get("is_profile"):
+        selected_profile_type = "uploads"
+    return {
+        "url_kind": info.get("kind", "unknown"),
+        "profile_type": selected_profile_type,
+        "job_type": job_type_for(preset, normalized, info, selected_profile_type),
+    }
 
 
 def validate_soundcloud_url(raw_url: str) -> str:
@@ -915,10 +1136,10 @@ def source_type_for(preset_id: str, target: str) -> str:
         return "likes"
     parsed = urlparse(target)
     parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if preset_id == "profile-uploads" or len(parts) == 1 or (len(parts) == 2 and parts[1] in PROFILE_PATH_DEFAULTS):
+        return "profile"
     if "sets" in parts or preset_id == "playlist-best":
         return "playlist"
-    if len(parts) == 1:
-        return "profile"
     return "single"
 
 
@@ -931,30 +1152,8 @@ def use_playlist_folders(settings: dict[str, Any]) -> bool:
 
 
 def organization_download_dir(preset_id: str, target: str, settings: dict[str, Any]) -> Path:
-    mode = str(settings.get("organization_mode") or "library-clean")
-    source_type = source_type_for(preset_id, target)
-    if mode in {"scdl-default", "flat"}:
-        path = DOWNLOAD_DIR
-    elif mode == "by-artist":
-        path = DOWNLOAD_DIR / "Artists"
-    elif mode == "by-playlist":
-        path = DOWNLOAD_DIR / ("Playlists" if source_type == "playlist" else "Singles")
-    elif mode == "by-source-type":
-        path = DOWNLOAD_DIR / {
-            "likes": "Likes",
-            "playlist": "Playlists",
-            "profile": "Profiles",
-            "single": "Singles",
-        }.get(source_type, "Unknown")
-    else:
-        path = DOWNLOAD_DIR / {
-            "likes": "Likes" if settings.get("put_likes_in_likes_folder", True) else "Artists",
-            "playlist": "Playlists",
-            "profile": "Artists",
-            "single": "Artists" if not settings.get("put_singles_in_singles_folder", True) else "Singles",
-        }.get(source_type, "Unknown")
-    path.mkdir(parents=True, exist_ok=True)
-    return path.resolve()
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    return DOWNLOAD_DIR.resolve()
 
 
 def scdl_default_name_format(settings: dict[str, Any]) -> str:
@@ -998,6 +1197,7 @@ def organization_preview(settings: dict[str, Any]) -> list[str]:
         "Likes/J Dilla/Song Title.flac",
         "Playlists/Beat Tape/001 - Artist - Track.opus",
         "Artists/Artist/Track.mp3",
+        "Profiles/Profile Name/Uploads/Track Title.m4a",
     ]
 
 
@@ -1031,22 +1231,39 @@ def build_scdl_args(
     target: str,
     *,
     archive_enabled: Optional[bool] = None,
+    profile_type: Optional[str] = None,
 ) -> tuple[list[str], list[str], bool]:
     settings = load_settings()
     preset = PRESETS.get(preset_id)
     if not preset:
         raise HTTPException(status_code=400, detail="Unknown preset")
 
+    url_info: dict[str, Any] = {"kind": "me-likes", "is_profile": False, "is_track": False, "is_playlist": False}
+    selected_profile_type: Optional[str] = None
     if preset.needs_url:
         target = validate_soundcloud_url(target)
+        url_info = classify_soundcloud_url(target)
+        if preset.id == "check-qualities" and not url_info.get("is_track"):
+            raise HTTPException(
+                status_code=400,
+                detail="Check Qualities is for individual track URLs. For profiles or playlists, choose a download type and start a download.",
+            )
+        if preset.id == "profile-uploads" and not url_info.get("is_profile"):
+            raise HTTPException(status_code=400, detail="Profile Uploads / Tracks is for SoundCloud profile URLs.")
+        selected_profile_type = normalize_profile_type(profile_type, url_info, settings)
+        if preset.id == "profile-uploads" and url_info.get("is_profile"):
+            selected_profile_type = "uploads"
     else:
         target = "me likes"
         if not get_auth_token(settings):
             raise HTTPException(status_code=400, detail="A SoundCloud auth token is required for My Likes Sync")
 
-    args: list[str] = []
-    for arg in preset.args:
-        args.append(target if arg == "{url}" else arg)
+    if selected_profile_type:
+        args = ["-l", target, str(PROFILE_DOWNLOAD_TYPES[selected_profile_type]["flag"]), "--best-quality"]
+    else:
+        args = []
+        for arg in preset.args:
+            args.append(target if arg == "{url}" else arg)
 
     should_use_archive = settings.get("archive_enabled", True) if archive_enabled is None else archive_enabled
     if preset.id == "likes-best":
@@ -1074,7 +1291,9 @@ def build_scdl_args(
             args.append("--original-metadata")
         if settings.get("force_metadata") and "--force-metadata" not in args:
             args.append("--force-metadata")
-        if settings.get("original_art"):
+        if selected_profile_type and "--original-art" not in args:
+            args.append("--original-art")
+        if settings.get("original_art") and "--original-art" not in args:
             args.append("--original-art")
         if settings.get("add_description"):
             args.append("--add-description")
@@ -1398,12 +1617,21 @@ def destination_for_record(path: Path, record: dict[str, Any], item: QueueItem, 
     title = safe_filename_stem(record.get("title") or path.stem, fallback="Track")
     playlist = safe_path_component(record.get("playlist") or record.get("album_or_playlist_title") or "Unknown Playlist")
     uploader = safe_path_component(record.get("uploader") or "Unknown")
+    profile_section = {
+        "uploads": "Uploads",
+        "all": "All Tracks + Reposts",
+        "likes": "Likes",
+        "playlists": "Playlists",
+        "reposts": "Reposts",
+    }.get(item.profile_type or "", "Uploads")
     track_id = safe_filename_stem(record.get("track_id") or "", fallback="", max_length=32)
     date_prefix = dated_prefix(record) if settings.get("include_upload_date_in_filename") else ""
     id_suffix = f" [{track_id}]" if settings.get("include_track_id_in_filename") and track_id else ""
     ext = path.suffix
     if source_type == "playlist":
         stem = f"{playlist_index(record)} - {artist} - {title}{id_suffix}"
+    elif source_type == "profile" and item.profile_type == "playlists":
+        stem = f"{playlist_index(record)} - {title}{id_suffix}"
     elif mode == "by-playlist":
         stem = f"{date_prefix}{artist} - {title}{id_suffix}"
     elif mode == "flat":
@@ -1424,7 +1652,9 @@ def destination_for_record(path: Path, record: dict[str, Any], item: QueueItem, 
         elif source_type == "playlist":
             folder = DOWNLOAD_DIR / "Playlists" / playlist if use_playlist_folders(settings) else DOWNLOAD_DIR / "Playlists"
         elif source_type == "profile":
-            folder = DOWNLOAD_DIR / "Profiles" / uploader
+            folder = DOWNLOAD_DIR / "Profiles" / uploader / profile_section
+            if item.profile_type == "playlists" and use_playlist_folders(settings):
+                folder = folder / playlist
         else:
             folder = DOWNLOAD_DIR / "Singles" / artist
     else:
@@ -1432,6 +1662,10 @@ def destination_for_record(path: Path, record: dict[str, Any], item: QueueItem, 
             folder = DOWNLOAD_DIR / "Likes" / artist if settings.get("put_likes_in_likes_folder", True) else DOWNLOAD_DIR / "Artists" / artist
         elif source_type == "playlist":
             folder = DOWNLOAD_DIR / "Playlists" / playlist if use_playlist_folders(settings) else DOWNLOAD_DIR / "Playlists"
+        elif source_type == "profile":
+            folder = DOWNLOAD_DIR / "Profiles" / uploader / profile_section
+            if item.profile_type == "playlists" and use_playlist_folders(settings):
+                folder = folder / playlist
         elif artist == "Unknown Artist":
             folder = DOWNLOAD_DIR / "Unknown" / uploader
         elif source_type == "single" and settings.get("put_singles_in_singles_folder", True):
@@ -1592,6 +1826,36 @@ def is_auth_related_error(text: str) -> bool:
     )
 
 
+def parse_rate_limit_backoff(line: str) -> Optional[int]:
+    lower = line.lower()
+    if "rate-limit" not in lower and "rate limited" not in lower and "429" not in lower:
+        return None
+    match = re.search(r"(?:delaying|backoff|retry(?:-after)?|retry after)[^\d]{0,30}(\d+)\s*(?:s|sec|secs|second|seconds)?", lower)
+    if match:
+        return int(match.group(1))
+    retry_match = re.search(r"retry-after[^\d]{0,20}(\d+)", lower)
+    if retry_match:
+        return int(retry_match.group(1))
+    return 0
+
+
+def parse_rate_limit_reset(line: str) -> Optional[float]:
+    retry_after = re.search(r"retry-after[^\d]{0,20}(\d+)", line, re.IGNORECASE)
+    if retry_after:
+        return time.time() + int(retry_after.group(1))
+    reset = re.search(r"reset(?:_time)?[^\d]{0,20}(\d{10,})", line, re.IGNORECASE)
+    if reset:
+        value = int(reset.group(1))
+        return value / 1000 if value > 9_999_999_999 else float(value)
+    return None
+
+
+def rate_limit_message(item: QueueItem) -> str:
+    if item.rate_limit_retry_at:
+        return f"SoundCloud rate-limited this job. Safe to resume after: {iso_time(item.rate_limit_retry_at)}"
+    return "SoundCloud rate-limited this job. Try again later. Your downloaded tracks are saved and archive will skip completed tracks."
+
+
 def parse_quality_output(output: str) -> dict[str, Any]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     qualities = []
@@ -1675,19 +1939,24 @@ class QueueManager:
             ):
                 raise HTTPException(status_code=409, detail="A Likes Sync job is already pending or running")
             for target in targets:
+                context = job_context(preset, target, request.profile_type)
                 command, masked, archive_enabled = build_scdl_args(
                     request.preset,
                     target,
                     archive_enabled=request.archive_enabled,
+                    profile_type=context["profile_type"],
                 )
                 job_id = uuid.uuid4().hex[:12]
                 is_likes_sync = preset.id == "likes-best"
                 item = QueueItem(
                     id=job_id,
                     preset_id=preset.id,
-                    preset_name=preset.name,
+                    preset_name=context["job_type"] if context["profile_type"] else preset.name,
                     target=target if preset.needs_url else "My likes",
                     target_url=target if preset.needs_url else "me likes",
+                    url_kind=context["url_kind"],
+                    profile_type=context["profile_type"],
+                    job_type=context["job_type"],
                     command=command,
                     masked_command=masked,
                     archive_enabled=archive_enabled,
@@ -1735,6 +2004,9 @@ class QueueManager:
 
     async def append_log(self, item: QueueItem, text: str) -> None:
         token = get_auth_token()
+        settings = load_settings()
+        max_backoff = int(settings.get("max_rate_limit_backoff_seconds", 900))
+        max_repeated = int(settings.get("max_consecutive_rate_limits", 8))
         clean = mask_text(text, token).replace("\r", "\n")
         lines = clean.splitlines() or [clean]
         with item.log_path.open("a", encoding="utf-8") as handle:
@@ -1742,6 +2014,28 @@ class QueueManager:
                 line = raw_line.rstrip()
                 if not line:
                     continue
+                backoff = parse_rate_limit_backoff(line)
+                pause_due_to_repeated = False
+                pause_due_to_cap = False
+                if backoff is not None:
+                    item.rate_limit_count += 1
+                    capped = min(max(backoff, 0), max_backoff)
+                    item.last_rate_limit_backoff = capped
+                    item.rate_limit_retry_at = parse_rate_limit_reset(line) or (time.time() + capped if capped else None)
+                    if backoff > max_backoff:
+                        line = f"Rate limited. Backoff capped at {max_backoff}s."
+                        pause_due_to_cap = True
+                        item.rate_limit_pause_requested = True
+                    elif backoff > 0:
+                        line = f"Rate limited. Backoff {capped}s."
+                    else:
+                        line = "Rate limited."
+                    if item.rate_limit_count >= max_repeated:
+                        pause_due_to_repeated = True
+                        item.rate_limit_pause_requested = True
+                        item.last_error = "Repeated rate limits reached. Pausing job safely."
+                elif re.search(r"\b(receiving|downloaded|saved|applying metadata|finished)\b", line, re.IGNORECASE):
+                    item.rate_limit_count = 0
                 item.logs.append(line)
                 item.logs = item.logs[-MAX_LOG_LINES:]
                 if re.search(
@@ -1752,6 +2046,22 @@ class QueueManager:
                     item.last_error = line[-500:]
                 handle.write(line + "\n")
                 await self.broadcast({"type": "log", "item_id": item.id, "line": line})
+                if item.rate_limit_pause_requested:
+                    pause_line = (
+                        "Repeated rate limits reached. Pausing job safely."
+                        if pause_due_to_repeated
+                        else "Rate-limit backoff cap reached. Pausing job safely."
+                    )
+                    if pause_due_to_repeated or pause_due_to_cap:
+                        if pause_line not in item.logs[-3:]:
+                            item.logs.append(pause_line)
+                            handle.write(pause_line + "\n")
+                            await self.broadcast({"type": "log", "item_id": item.id, "line": pause_line})
+                    resume_line = "Safe to resume later; archive will skip completed tracks."
+                    if resume_line not in item.logs[-3:]:
+                        item.logs.append(resume_line)
+                        handle.write(resume_line + "\n")
+                        await self.broadcast({"type": "log", "item_id": item.id, "line": resume_line})
         item.updated_at = time.time()
 
     async def run_item(self, item: QueueItem) -> None:
@@ -1762,6 +2072,7 @@ class QueueManager:
                 item.preset_id,
                 item.target_url,
                 archive_enabled=item.archive_enabled,
+                profile_type=item.profile_type,
             )
             item.command = command
             item.masked_command = masked
@@ -1800,6 +2111,9 @@ class QueueManager:
                 if not line:
                     break
                 await self.append_log(item, line.decode("utf-8", errors="replace"))
+                if item.rate_limit_pause_requested:
+                    await self.terminate_process(item)
+                    break
             item.return_code = await process.wait()
         except asyncio.CancelledError:
             await self.terminate_process(item)
@@ -1820,7 +2134,15 @@ class QueueManager:
             item.finished_at = time.time()
             item.updated_at = item.finished_at
             if item.status != "Cancelled":
-                if item.summary.get("skipped"):
+                if item.rate_limit_pause_requested:
+                    item.status = RATE_LIMITED_STATUS
+                    item.return_code = None
+                    item.last_error = rate_limit_message(item)
+                    item.summary.setdefault("warnings", []).append(item.last_error)
+                    item.summary["rate_limited"] = True
+                    item.summary["retry_after"] = iso_time(item.rate_limit_retry_at)
+                    item.summary["last_backoff_seconds"] = item.last_rate_limit_backoff
+                elif item.summary.get("skipped"):
                     item.status = "Skipped"
                 elif item.return_code == 0:
                     item.status = "Done"
@@ -1844,7 +2166,7 @@ class QueueManager:
                 item.summary["metadata_records"] = item.metadata_records[:20]
             persist_item(item)
             async with self.lock:
-                if auth_error:
+                if auth_error or item.status == RATE_LIMITED_STATUS:
                     self.paused = True
                 if self.stop_after_current:
                     self.paused = True
@@ -1870,14 +2192,18 @@ class QueueManager:
         async with self.lock:
             if item_id:
                 pending_item = next(
-                    (candidate for candidate in self.items if candidate.id == item_id and candidate.status == "Pending"),
+                    (
+                        candidate
+                        for candidate in self.items
+                        if candidate.id == item_id and candidate.status in {"Pending", RATE_LIMITED_STATUS}
+                    ),
                     None,
                 )
                 if pending_item:
                     pending_item.status = "Cancelled"
                     pending_item.finished_at = time.time()
                     pending_item.updated_at = pending_item.finished_at
-                    pending_item.last_error = "Cancelled before running"
+                    pending_item.last_error = "Stopped by user"
                     persist_item(pending_item)
                     cancelled_pending = True
             candidates = [item for item in self.items if item.status == "Running"]
@@ -1914,6 +2240,10 @@ class QueueManager:
             item.summary = {}
             item.last_error = None
             item.output_file = None
+            item.rate_limit_count = 0
+            item.last_rate_limit_backoff = None
+            item.rate_limit_retry_at = None
+            item.rate_limit_pause_requested = False
             item.updated_at = time.time()
             persist_item(item)
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
@@ -1922,7 +2252,7 @@ class QueueManager:
     async def retry_failed(self) -> None:
         async with self.lock:
             for item in self.items:
-                if item.status == "Failed":
+                if item.status in {"Failed", RATE_LIMITED_STATUS}:
                     item.status = "Pending"
                     item.return_code = None
                     item.started_at = None
@@ -1932,6 +2262,10 @@ class QueueManager:
                     item.summary = {}
                     item.last_error = None
                     item.output_file = None
+                    item.rate_limit_count = 0
+                    item.last_rate_limit_backoff = None
+                    item.rate_limit_retry_at = None
+                    item.rate_limit_pause_requested = False
                     item.updated_at = time.time()
                     persist_item(item)
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
@@ -1958,7 +2292,7 @@ class QueueManager:
             await self.kick()
             return selected
 
-        failed = failed_likes_items()
+        failed = retryable_likes_items()
         if retry_failed_only:
             if not failed:
                 raise HTTPException(status_code=404, detail="No failed Likes Sync jobs to retry")
@@ -1976,10 +2310,18 @@ class QueueManager:
             selected.summary = {}
             selected.output_file = None
             selected.last_error = None
+            selected.rate_limit_count = 0
+            selected.last_rate_limit_backoff = None
+            selected.rate_limit_retry_at = None
+            selected.rate_limit_pause_requested = False
             selected.updated_at = time.time()
             persist_item(selected)
             async with self.lock:
-                if not any(item.id == selected.id for item in self.items):
+                for index, item in enumerate(self.items):
+                    if item.id == selected.id:
+                        self.items[index] = selected
+                        break
+                else:
                     self.items.append(selected)
                 self.paused = False
                 self.stop_after_current = False
@@ -2079,6 +2421,11 @@ async def get_settings() -> dict[str, Any]:
     return public_settings()
 
 
+@app.post("/api/url-info")
+async def get_url_info(request: UrlInfoRequest) -> dict[str, Any]:
+    return classify_soundcloud_url(request.url)
+
+
 @app.put("/api/settings")
 async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
     settings = load_settings()
@@ -2096,7 +2443,13 @@ async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
             settings[key] = max(1, int(value))
         elif key == "download_delay_seconds" and value is not None:
             settings[key] = max(0.0, float(value))
+        elif key == "max_rate_limit_backoff_seconds" and value is not None:
+            settings[key] = max(1, int(value))
+        elif key == "max_consecutive_rate_limits" and value is not None:
+            settings[key] = max(1, int(value))
         elif key == "default_preset" and value in PRESETS:
+            settings[key] = value
+        elif key == "default_profile_download_type" and value in PROFILE_DOWNLOAD_TYPES:
             settings[key] = value
         elif key == "organization_mode" and value in ORGANIZATION_MODES:
             settings[key] = value

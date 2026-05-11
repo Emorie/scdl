@@ -145,6 +145,7 @@ FLAC and call that lossless.
 | Check Qualities | `scdl -l URL --list-qualities` |
 | My Likes Best Quality | `scdl me -f --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3` |
 | Playlist Best Quality | `scdl -l URL --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3` |
+| Profile Uploads / Tracks | `scdl -l URL -t --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3 --original-art` |
 | Metadata Repair / Force Metadata | `scdl -l URL --force-metadata --path /downloads --download-archive /config/archive.txt -c --retries 3` |
 
 If a SoundCloud auth token is configured, the web app appends
@@ -184,6 +185,8 @@ services:
     build: .
     container_name: scdl_web
     command:
+      - python
+      - -m
       - uvicorn
       - scdl_web.main:app
       - --host
@@ -202,6 +205,9 @@ services:
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
       - DOWNLOAD_DELAY_SECONDS=2
+      - MAX_RATE_LIMIT_BACKOFF_SECONDS=900
+      - MAX_CONSECUTIVE_RATE_LIMITS=8
+      - DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads
     volumes:
       - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
       - /volume3/docker/music-stack/appdata/scdl:/config
@@ -219,6 +225,59 @@ Set it one of two ways:
 - In the web UI settings panel. The value is saved to `/config/settings.json`.
 
 Tokens are masked in browser logs and command displays.
+
+### Downloading SoundCloud Profiles
+
+SoundCloud profile URLs need a profile download type because `scdl` requires a
+choice for user pages.
+
+- Uploads only: `-t`
+- All tracks + reposts: `-a`
+- Likes/favorites: `-f`
+- Playlists: `-p`
+- Reposts: `-r`
+
+Examples such as `https://soundcloud.com/username`,
+`https://soundcloud.com/username/tracks`,
+`https://soundcloud.com/username/reposts`, and
+`https://soundcloud.com/username/likes` are detected in the UI. For `/tracks`
+URLs, use `Profile Uploads / Tracks`. For your own account likes, use the
+dedicated `My Likes Sync` card instead of a normal profile URL.
+
+Profile downloads keep best-quality behavior and add the matching profile flag:
+
+```bash
+scdl -l URL -t --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3 --original-art
+```
+
+The profile selector can switch `-t` to `-a`, `-f`, `-p`, or `-r`. Check
+Qualities is only for individual track URLs, not profiles or playlists.
+
+### Handling SoundCloud Rate Limits
+
+SoundCloud can return HTTP `429 Too Many Requests`, especially during large
+likes or profile syncs. The web app watches `scdl` output for rate-limit
+messages, caps runaway backoff with `MAX_RATE_LIMIT_BACKOFF_SECONDS` (default
+`900`), and pauses safely after `MAX_CONSECUTIVE_RATE_LIMITS` repeated rate
+limits (default `8`).
+
+When this happens, the job is marked `Paused - Rate Limited` instead of sleeping
+for days. Resume is safe because `/config/archive.txt` remains the duplicate
+prevention source of truth and `/config/app.db` stores queue/history state. If
+`Retry-After` or reset timing is visible in output, the UI shows when it is safe
+to resume; otherwise, wait and try again later.
+
+For very large syncs, keep concurrency at `1`. If rate limits happen often,
+increase `DOWNLOAD_DELAY_SECONDS` to `5` or `10` in Docker Compose or Settings.
+
+### Recommended Settings for 20k+ Likes
+
+- `MAX_CONCURRENT_DOWNLOADS=1`
+- `DOWNLOAD_DELAY_SECONDS=5` or `10` if rate limits are frequent
+- `MAX_RATE_LIMIT_BACKOFF_SECONDS=900`
+- `MAX_CONSECUTIVE_RATE_LIMITS=8`
+- Archive enabled with persistent `/config`
+- Persistent `/downloads`
 
 ### Metadata and Search Tags
 

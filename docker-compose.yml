@@ -7,6 +7,8 @@ services:
     build: .
     container_name: scdl_web
     command:
+      - python
+      - -m
       - uvicorn
       - scdl_web.main:app
       - --host
@@ -25,6 +27,9 @@ services:
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
       - DOWNLOAD_DELAY_SECONDS=2
+      - MAX_RATE_LIMIT_BACKOFF_SECONDS=900
+      - MAX_CONSECUTIVE_RATE_LIMITS=8
+      - DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads
     volumes:
       - /volume1/arr-stack-music/downloads/music/soundcloud:/downloads
       - /volume3/docker/music-stack/appdata/scdl:/config

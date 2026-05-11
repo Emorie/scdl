@@ -8,6 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEFAULT_PRESET=best-original \
     MAX_CONCURRENT_DOWNLOADS=1 \
     DOWNLOAD_DELAY_SECONDS=2 \
+    MAX_RATE_LIMIT_BACKOFF_SECONDS=900 \
+    MAX_CONSECUTIVE_RATE_LIMITS=8 \
+    DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads \
     TZ=America/New_York
 
 RUN apt-get update \
@@ -31,4 +34,4 @@ RUN chmod +x /app/docker/entrypoint.sh
 EXPOSE 8090
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]
-CMD ["uvicorn", "scdl_web.main:app", "--host", "0.0.0.0", "--port", "8090"]
+CMD ["python", "-m", "uvicorn", "scdl_web.main:app", "--host", "0.0.0.0", "--port", "8090"]

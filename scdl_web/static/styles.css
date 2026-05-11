@@ -242,7 +242,7 @@ input[type="checkbox"] {
 
 .form-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.45fr);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 14px;
   margin-top: 14px;
 }
@@ -381,6 +381,47 @@ button,
 
 .quality-key {
   padding-top: 4px;
+}
+
+.url-inspector,
+.helper-list,
+.rate-limit-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.url-inspector {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.helper-list {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.helper-list strong {
+  color: var(--text);
+}
+
+.rate-limit-note {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(244, 185, 66, 0.46);
+  border-radius: var(--radius);
+  background: rgba(244, 185, 66, 0.09);
+  color: #ffedbe;
+  font-size: 0.85rem;
+}
+
+.rate-limit-note span {
+  color: #ffedbe;
 }
 
 .stats-grid {
@@ -531,13 +572,18 @@ button,
 .status-done .progress-bar,
 .status-skipped .progress-bar,
 .status-failed .progress-bar,
-.status-cancelled .progress-bar {
+.status-cancelled .progress-bar,
+.status-paused---rate-limited .progress-bar {
   width: 100%;
 }
 
 .status-failed .progress-bar,
 .status-cancelled .progress-bar {
   background: var(--rose);
+}
+
+.status-paused---rate-limited .progress-bar {
+  background: var(--amber);
 }
 
 @keyframes pulse-width {
