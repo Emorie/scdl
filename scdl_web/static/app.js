@@ -69,6 +69,35 @@ function renderPresets() {
   renderPresetPanel();
 }
 
+function fillSelect(select, values, selected) {
+  select.innerHTML = "";
+  Object.entries(values || {}).forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  });
+  select.value = selected;
+}
+
+function renderOrganizationPreview(settings) {
+  const preview = previewForMode(settings.organization_mode || "library-clean", settings.organization_preview || []);
+  $("organization-preview").className = "mini-log";
+  $("organization-preview").innerHTML = preview.map((line) => `<code>${escapeHtml(line)}</code>`).join("");
+}
+
+function previewForMode(mode, fallback = []) {
+  const previews = {
+    flat: ["J Dilla - Song Title.flac", "Artist - Track.opus", "Uploader - DJ Edit.mp3"],
+    "by-artist": ["Artists/J Dilla/Song Title.flac", "Artists/Artist/Track.opus"],
+    "by-playlist": ["Playlists/Beat Tape/001 - Artist - Track.opus", "Singles/Artist - Track.mp3"],
+    "by-source-type": ["Likes/J Dilla/Song Title.flac", "Playlists/Beat Tape/001 - Artist - Track.opus", "Singles/Artist/Track.mp3"],
+    "scdl-default": ["scdl chooses the original output folders and filenames"],
+    "library-clean": ["Likes/J Dilla/Song Title.flac", "Playlists/Beat Tape/001 - Artist - Track.opus", "Artists/Artist/Track.mp3"],
+  };
+  return previews[mode] || fallback;
+}
+
 function renderPresetPanel() {
   const preset = state.presets.find((item) => item.id === selectedPreset());
   if (!preset) return;
@@ -97,10 +126,23 @@ function renderSettings() {
   $("playlist-format").value = settings.playlist_name_format || "";
   $("max-concurrent").value = settings.max_concurrent_downloads || 1;
   $("download-delay").value = settings.download_delay_seconds ?? 2;
-  $("artist-folders").checked = !!settings.artist_folders;
-  $("flat-folder").checked = !!settings.no_playlist_folder;
   $("original-art").checked = !!settings.original_art;
   $("add-description").checked = !!settings.add_description;
+  fillSelect($("artist-priority"), settings.artist_priority_modes, settings.artist_metadata_priority || "smart-auto");
+  $("preserve-original-metadata").checked = !!settings.preserve_original_metadata;
+  $("force-metadata-toggle").checked = !!settings.force_metadata;
+  $("save-sidecar-json").checked = !!settings.save_sidecar_json;
+  $("embed-soundcloud-tags").checked = !!settings.embed_soundcloud_tags;
+  $("parse-artist-title").checked = !!settings.parse_artist_from_title;
+  $("search-tags-enabled").checked = !!settings.search_tags_enabled;
+  fillSelect($("organization-mode"), settings.organization_modes, settings.organization_mode || "library-clean");
+  $("use-playlist-folders").checked = !!settings.use_playlist_folders;
+  $("likes-folder").checked = !!settings.put_likes_in_likes_folder;
+  $("singles-folder").checked = !!settings.put_singles_in_singles_folder;
+  $("sanitize-filenames").checked = !!settings.sanitize_filenames;
+  $("include-track-id").checked = !!settings.include_track_id_in_filename;
+  $("include-upload-date").checked = !!settings.include_upload_date_in_filename;
+  renderOrganizationPreview(settings);
   $("auth-status-badge").textContent = settings.auth_configured ? `Auth: ${settings.auth_source}` : "Auth missing";
   $("auth-status-badge").className = settings.auth_configured ? "pill ok" : "pill warn";
 }
@@ -163,6 +205,7 @@ function renderLikesCurrent(queue) {
 
 function renderQueueItem(item) {
   const badges = (item.summary?.badges || []).map(qualityBadge).join("");
+  const metadata = item.metadata_records?.[0] || {};
   const files = (item.files || [])
     .slice(0, 6)
     .map((file) => `<span class="quality-badge neutral">${escapeHtml(file.name)} | ${escapeHtml(file.size_label)}</span>`)
@@ -185,6 +228,7 @@ function renderQueueItem(item) {
       </div>
       <div class="progress-shell"><div class="progress-bar"></div></div>
       <div class="summary-grid">${badges}${files}</div>
+      ${metadata.title ? `<p class="metadata-line">${escapeHtml(metadata.artist || metadata.uploader || "Unknown Artist")} - ${escapeHtml(metadata.title)}</p>` : ""}
       <details>
         <summary>Logs and command</summary>
         <pre class="log-view">${escapeHtml(command + "\n\n" + (item.logs || []).join("\n"))}</pre>
@@ -235,7 +279,8 @@ function renderRecent(data) {
       <div class="recent-row">
         <div>
           <strong>${escapeHtml(file.name)}</strong>
-          <span>${escapeHtml(file.folder)} / ${escapeHtml(file.extension.toUpperCase())}</span>
+          <span>${escapeHtml(file.metadata?.artist || file.folder)} / ${escapeHtml(file.extension.toUpperCase())}</span>
+          ${file.metadata?.tags?.length ? `<span>${escapeHtml(file.metadata.tags.slice(0, 6).join(", "))}</span>` : ""}
         </div>
         <div>
           <strong>${escapeHtml(file.size_label)}</strong>
@@ -281,6 +326,7 @@ function renderHealth(data) {
 function renderStats(data) {
   $("stat-archive").textContent = data.archive_count ?? 0;
   $("stat-history").textContent = data.history_count ?? 0;
+  $("stat-metadata").textContent = data.metadata_count ?? 0;
   $("stat-processed").textContent = data.total_processed ?? 0;
   $("stat-downloaded").textContent = data.downloaded ?? 0;
   $("stat-skipped").textContent = data.skipped ?? 0;
@@ -324,12 +370,18 @@ function renderHistory(data) {
   }
   list.className = "history-list";
   list.innerHTML = data.items
-    .map(
-      (item) => `
+    .map((item) => {
+      const metadata = item.metadata_records?.[0] || {};
+      const headline = metadata.title
+        ? `${metadata.artist || metadata.uploader || "Unknown Artist"} - ${metadata.title}`
+        : item.preset_name;
+      const tagLine = [metadata.genre, ...(metadata.tags || []).slice(0, 5)].filter(Boolean).join(", ");
+      return `
         <div class="history-row">
           <div>
-            <strong>${escapeHtml(item.preset_name)}</strong>
-            <span>${escapeHtml(item.target_url || item.target)}</span>
+            <strong>${escapeHtml(headline)}</strong>
+            <span>${escapeHtml(metadata.output_path || item.target_url || item.target)}</span>
+            ${tagLine ? `<span>${escapeHtml(tagLine)}</span>` : ""}
             ${item.last_error ? `<span>${escapeHtml(item.last_error)}</span>` : ""}
           </div>
           <div>
@@ -337,8 +389,8 @@ function renderHistory(data) {
             <span>${escapeHtml(item.updated_at || "")}</span>
           </div>
         </div>
-      `,
-    )
+      `;
+    })
     .join("");
 }
 
@@ -410,10 +462,23 @@ async function saveSettings(clearToken = false, options = {}) {
     archive_enabled: $("archive-enabled").checked,
     name_format: $("name-format").value.trim(),
     playlist_name_format: $("playlist-format").value.trim(),
-    no_playlist_folder: $("flat-folder").checked,
-    artist_folders: $("artist-folders").checked,
+    no_playlist_folder: !$("use-playlist-folders").checked,
     original_art: $("original-art").checked,
     add_description: $("add-description").checked,
+    artist_metadata_priority: $("artist-priority").value,
+    preserve_original_metadata: $("preserve-original-metadata").checked,
+    force_metadata: $("force-metadata-toggle").checked,
+    save_sidecar_json: $("save-sidecar-json").checked,
+    embed_soundcloud_tags: $("embed-soundcloud-tags").checked,
+    parse_artist_from_title: $("parse-artist-title").checked,
+    search_tags_enabled: $("search-tags-enabled").checked,
+    organization_mode: $("organization-mode").value,
+    use_playlist_folders: $("use-playlist-folders").checked,
+    put_likes_in_likes_folder: $("likes-folder").checked,
+    put_singles_in_singles_folder: $("singles-folder").checked,
+    sanitize_filenames: $("sanitize-filenames").checked,
+    include_track_id_in_filename: $("include-track-id").checked,
+    include_upload_date_in_filename: $("include-upload-date").checked,
     max_concurrent_downloads: Number($("max-concurrent").value || 1),
     download_delay_seconds: Number($("download-delay").value || 0),
     default_preset: selectedPreset(),
@@ -508,6 +573,9 @@ function wireEvents() {
     }),
   );
   $("save-settings").addEventListener("click", () => saveSettings(false).catch((error) => toast("Settings failed", error.message, "bad")));
+  $("organization-mode").addEventListener("change", () => {
+    $("organization-preview").innerHTML = previewForMode($("organization-mode").value).map((line) => `<code>${escapeHtml(line)}</code>`).join("");
+  });
   $("test-auth").addEventListener("click", async () => {
     try {
       const tokenValue = $("auth-token").value.trim();

@@ -417,6 +417,12 @@ button,
   text-align: left;
 }
 
+.mini-log code {
+  display: block;
+  margin: 4px 0;
+  word-break: break-word;
+}
+
 .panel-subtitle {
   margin: 14px 0 8px;
   font-size: 0.82rem;
@@ -548,6 +554,12 @@ button,
   flex-wrap: wrap;
   gap: 7px;
   margin-top: 10px;
+}
+
+.metadata-line {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 .settings-grid {

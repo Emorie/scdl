@@ -123,6 +123,11 @@ Default web downloads run:
 scdl -l URL --best-quality --path /downloads --download-archive /config/archive.txt -c --retries 3
 ```
 
+Metadata and organization settings may add approved `scdl` flags such as
+`--name-format`, `--playlist-name-format`, `--original-metadata`, or
+`--force-metadata`. The web app still builds commands from preset argument
+arrays and never shells out to arbitrary browser input.
+
 `Best Original Available` is the default preset. It uses this fork's
 `--best-quality` behavior: try original/lossless first, convert original
 lossless sources to FLAC when the CLI confirms that path is available, then fall
@@ -215,6 +220,68 @@ Set it one of two ways:
 
 Tokens are masked in browser logs and command displays.
 
+### Metadata and Search Tags
+
+SoundCloud metadata can be messy. The uploader is often not the real artist,
+especially for remixes, edits, reposted DJ sets, and random profile uploads.
+Tagged metadata or title patterns may contain a better artist candidate.
+
+The web app preserves metadata in `/config/app.db` for search and history. For
+each new downloaded audio file it records the output path, title, selected
+artist, uploader, embedded/tagged artist, parsed artist candidate, genre, tags,
+description, source URL, track ID when known, playlist/album context when
+confident, artwork URL when available, date, downloaded time, and quality
+summary.
+
+The Metadata Settings card controls artist priority:
+
+- `Smart Auto`: prefer embedded/tagged artist, then SoundCloud uploader, then
+  a title parse candidate, then `Unknown Artist`.
+- `Uploader First`: use the SoundCloud profile/uploader first.
+- `Tagged Metadata First`: prefer embedded/tagged artist first.
+- `Title Parse First`: try patterns such as `Artist - Track`, `Artist: Track`,
+  `Song Title (Artist Remix)`, and `Song Title [Artist Edit]` before falling
+  back.
+
+By default, the app preserves original metadata, asks `scdl` to keep original
+file metadata when possible, then fills missing tags after download with
+Mutagen. `Force Metadata` is for intentional repair passes where you want more
+aggressive filling/overwriting. Music apps vary in which fields they read, so
+genre/tags/source URL may show differently depending on file type and player.
+
+Optional sidecar JSON can be enabled in the UI. Sidecars are written next to
+new audio files as `{filename}.ext.json` and are useful for future library
+organizers or manual cleanup.
+
+History search includes title, artist, uploader, tagged artist, parsed artist,
+genre, tags, playlist, source URL, and track ID when those fields are known.
+
+### Download Organization
+
+The Organization card controls new downloads only. It does not move old files;
+a future library organizer can handle that separately.
+
+Modes:
+
+- `Library Clean` is the default and recommended daily mode. Likes go under
+  `Likes/{artist_or_uploader}`, playlists under
+  `Playlists/{playlist_title}`, singles under `Artists/{artist_or_uploader}`,
+  and uncertain metadata under `Unknown`.
+- `Flat Downloads` puts everything directly in `/downloads` with clean
+  `{artist_or_uploader} - {track_title}` filenames. Use it only for quick tests.
+- `By Artist` puts downloads under `Artists/{artist_or_uploader}`.
+- `By Playlist` keeps playlist downloads under `Playlists/{playlist_title}` and
+  puts non-playlist tracks under `Singles`.
+- `By Source Type` separates `Likes`, `Playlists`, `Singles`, and `Profiles`.
+  This is a strong choice for very large likes libraries.
+- `Original Structure / scdl Default` leaves `scdl`'s original folder behavior
+  alone.
+
+For 20k+ liked tracks, use `Library Clean` or `By Source Type`. The app uses
+NAS-safe filenames, avoids illegal path characters, keeps paths bounded, and
+adds the track ID or a short suffix if a filename collision occurs. You can
+also enable track IDs or upload dates in filenames from the UI.
+
 ### Syncing My SoundCloud Likes
 
 Use the `My Likes Sync` card when you want the app to resume through a large
@@ -255,6 +322,7 @@ items.
 - Archive: `/config/archive.txt`
 - History DB: `/config/app.db`
 - Logs: `/config/logs`
+- Optional sidecar JSON: next to downloaded audio files when enabled
 
 ### Updating on NAS
 

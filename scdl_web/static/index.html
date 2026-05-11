@@ -87,6 +87,7 @@
             <div class="stats-grid">
               <div><strong id="stat-archive">0</strong><span>Archive</span></div>
               <div><strong id="stat-history">0</strong><span>History</span></div>
+              <div><strong id="stat-metadata">0</strong><span>Metadata</span></div>
               <div><strong id="stat-processed">0</strong><span>Processed</span></div>
               <div><strong id="stat-downloaded">0</strong><span>Downloaded</span></div>
               <div><strong id="stat-skipped">0</strong><span>Skipped</span></div>
@@ -155,14 +156,6 @@
                 <button id="clear-token" class="ghost-button" type="button">Clear token</button>
               </div>
               <label class="field">
-                <span>Name format</span>
-                <input id="name-format" type="text" placeholder="{title}" />
-              </label>
-              <label class="field">
-                <span>Playlist format</span>
-                <input id="playlist-format" type="text" placeholder="{playlist[title]}_{title}" />
-              </label>
-              <label class="field">
                 <span>Max concurrent downloads</span>
                 <input id="max-concurrent" type="number" min="1" step="1" />
               </label>
@@ -172,11 +165,64 @@
               </label>
               <div class="toggle-list">
                 <label><input id="archive-enabled" type="checkbox" /> Archive by default</label>
-                <label><input id="artist-folders" type="checkbox" /> Artist folders</label>
-                <label><input id="flat-folder" type="checkbox" /> Flat playlist folder mode</label>
                 <label><input id="original-art" type="checkbox" /> Original artwork</label>
                 <label><input id="add-description" type="checkbox" /> Description text files</label>
               </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Metadata Settings</h2>
+                <p>Preserve first, fill missing fields second.</p>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Artist Metadata Priority</span>
+                <select id="artist-priority"></select>
+              </label>
+              <div class="toggle-list">
+                <label><input id="preserve-original-metadata" type="checkbox" /> Preserve original metadata</label>
+                <label><input id="force-metadata-toggle" type="checkbox" /> Force metadata</label>
+                <label><input id="save-sidecar-json" type="checkbox" /> Save sidecar JSON</label>
+                <label><input id="embed-soundcloud-tags" type="checkbox" /> Embed SoundCloud tags</label>
+                <label><input id="parse-artist-title" type="checkbox" /> Parse artist from title</label>
+                <label><input id="search-tags-enabled" type="checkbox" /> Search tags in history</label>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Organization</h2>
+                <p>Applies to new downloads only.</p>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Organization mode</span>
+                <select id="organization-mode"></select>
+              </label>
+              <label class="field">
+                <span>Name format</span>
+                <input id="name-format" type="text" placeholder="{user[username]} - {title}" />
+              </label>
+              <label class="field">
+                <span>Playlist format</span>
+                <input id="playlist-format" type="text" placeholder="{playlist[tracknumber]} - {user[username]} - {title}" />
+              </label>
+              <div class="toggle-list">
+                <label><input id="use-playlist-folders" type="checkbox" /> Use playlist folders</label>
+                <label><input id="likes-folder" type="checkbox" /> Put Likes in Likes folder</label>
+                <label><input id="singles-folder" type="checkbox" /> Put singles in Singles folder</label>
+                <label><input id="sanitize-filenames" type="checkbox" /> Sanitize filenames</label>
+                <label><input id="include-track-id" type="checkbox" /> Include track ID in filename</label>
+                <label><input id="include-upload-date" type="checkbox" /> Include upload date in filename</label>
+              </div>
+              <div id="organization-preview" class="mini-log empty-state">Choose an organization mode.</div>
             </div>
           </section>
 
@@ -225,7 +271,7 @@
                 <option>Skipped</option>
                 <option>Pending</option>
               </select>
-              <input id="history-search" type="search" placeholder="Search URL, title, error" />
+              <input id="history-search" type="search" placeholder="Search title, artist, tags, URL, track ID" />
             </div>
             <div id="history-list" class="history-list empty-state">No history yet.</div>
             <div class="history-pager">

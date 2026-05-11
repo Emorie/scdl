@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -38,6 +38,8 @@ RECENT_FILE_LIMIT = 100
 ARCHIVE_IMPORT_LIMIT = 5 * 1024 * 1024
 ACTIVE_STATUSES = {"Pending", "Running"}
 TERMINAL_STATUSES = {"Done", "Failed", "Skipped", "Cancelled"}
+AUDIO_EXTENSIONS = {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
+RELATED_FILE_EXTENSIONS = {".jpeg", ".jpg", ".png", ".txt"}
 MEDIA_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -52,6 +54,20 @@ MEDIA_EXTENSIONS = {
     ".png",
     ".txt",
     ".wav",
+}
+ORGANIZATION_MODES = {
+    "library-clean": "Library Clean",
+    "flat": "Flat Downloads",
+    "by-artist": "By Artist",
+    "by-playlist": "By Playlist",
+    "by-source-type": "By Source Type",
+    "scdl-default": "Original Structure / scdl Default",
+}
+ARTIST_PRIORITY_MODES = {
+    "smart-auto": "Smart Auto",
+    "uploader-first": "Uploader First",
+    "tagged-first": "Tagged Metadata First",
+    "title-parse-first": "Title Parse First",
 }
 
 
@@ -78,6 +94,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "artist_folders": False,
     "original_art": False,
     "add_description": False,
+    "artist_metadata_priority": "smart-auto",
+    "preserve_original_metadata": True,
+    "force_metadata": False,
+    "save_sidecar_json": False,
+    "embed_soundcloud_tags": True,
+    "parse_artist_from_title": True,
+    "search_tags_enabled": True,
+    "organization_mode": "library-clean",
+    "use_playlist_folders": True,
+    "put_likes_in_likes_folder": True,
+    "put_singles_in_singles_folder": False,
+    "sanitize_filenames": True,
+    "include_track_id_in_filename": False,
+    "include_upload_date_in_filename": False,
     "max_concurrent_downloads": env_int("MAX_CONCURRENT_DOWNLOADS", 1),
     "download_delay_seconds": env_float("DOWNLOAD_DELAY_SECONDS", 2),
     "default_preset": os.environ.get("DEFAULT_PRESET", "best-original"),
@@ -169,6 +199,20 @@ class SettingsUpdate(BaseModel):
     artist_folders: Optional[bool] = None
     original_art: Optional[bool] = None
     add_description: Optional[bool] = None
+    artist_metadata_priority: Optional[str] = None
+    preserve_original_metadata: Optional[bool] = None
+    force_metadata: Optional[bool] = None
+    save_sidecar_json: Optional[bool] = None
+    embed_soundcloud_tags: Optional[bool] = None
+    parse_artist_from_title: Optional[bool] = None
+    search_tags_enabled: Optional[bool] = None
+    organization_mode: Optional[str] = None
+    use_playlist_folders: Optional[bool] = None
+    put_likes_in_likes_folder: Optional[bool] = None
+    put_singles_in_singles_folder: Optional[bool] = None
+    sanitize_filenames: Optional[bool] = None
+    include_track_id_in_filename: Optional[bool] = None
+    include_upload_date_in_filename: Optional[bool] = None
     max_concurrent_downloads: Optional[int] = None
     download_delay_seconds: Optional[float] = None
     default_preset: Optional[str] = None
@@ -202,6 +246,7 @@ class QueueItem:
     logs: list[str] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+    metadata_records: list[dict[str, Any]] = field(default_factory=list)
     process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     task: Optional[asyncio.Task] = field(default=None, repr=False)
 
@@ -228,6 +273,7 @@ class QueueItem:
             "log_path": str(self.log_path),
             "files": self.files,
             "summary": self.summary,
+            "metadata_records": self.metadata_records,
         }
 
 
@@ -283,6 +329,39 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_likes ON queue_items(is_likes_sync, status)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS metadata_records (
+                id TEXT PRIMARY KEY,
+                queue_item_id TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                title TEXT,
+                artist TEXT,
+                uploader TEXT,
+                tagged_artist TEXT,
+                parsed_artist TEXT,
+                genre TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                tags_text TEXT,
+                description TEXT,
+                source_url TEXT,
+                track_id TEXT,
+                playlist TEXT,
+                album_or_playlist_title TEXT,
+                artwork_url TEXT,
+                created_or_release_date TEXT,
+                downloaded_at REAL NOT NULL,
+                quality_result_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL,
+                UNIQUE(queue_item_id, output_path)
+            )
+            """,
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_queue ON metadata_records(queue_item_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_output ON metadata_records(output_path)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_track ON metadata_records(track_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_search ON metadata_records(tags_text, artist, title)")
+        conn.execute(
+            """
             UPDATE queue_items
             SET status = 'Pending',
                 updated_at = ?,
@@ -301,6 +380,151 @@ def json_loads(value: Optional[str], fallback: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return fallback
+
+
+def metadata_row_public(row: sqlite3.Row) -> dict[str, Any]:
+    record = json_loads(row["metadata_json"], {})
+    public = {
+        "id": row["id"],
+        "queue_item_id": row["queue_item_id"],
+        "output_path": row["output_path"],
+        "title": row["title"],
+        "artist": row["artist"],
+        "uploader": row["uploader"],
+        "tagged_artist": row["tagged_artist"],
+        "parsed_artist": row["parsed_artist"],
+        "genre": row["genre"],
+        "tags": json_loads(row["tags_json"], []),
+        "description": row["description"],
+        "source_url": row["source_url"],
+        "track_id": row["track_id"],
+        "playlist": row["playlist"],
+        "album_or_playlist_title": row["album_or_playlist_title"],
+        "artwork_url": row["artwork_url"],
+        "created_or_release_date": row["created_or_release_date"],
+        "downloaded_at": iso_time(row["downloaded_at"]),
+        "quality_result": json_loads(row["quality_result_json"], {}),
+    }
+    public.update({key: value for key, value in record.items() if key not in public})
+    return public
+
+
+def metadata_for_queue(queue_item_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM metadata_records
+            WHERE queue_item_id = ?
+            ORDER BY downloaded_at DESC
+            LIMIT ?
+            """,
+            (queue_item_id, limit),
+        ).fetchall()
+    return [metadata_row_public(row) for row in rows]
+
+
+def metadata_by_output_path(output_path: str) -> Optional[dict[str, Any]]:
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM metadata_records
+                WHERE output_path = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (output_path,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return metadata_row_public(row) if row else None
+
+
+def upsert_metadata_record(queue_item_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    now = time.time()
+    tags = normalize_tags(record.get("tags"))
+    record = dict(record)
+    record["tags"] = tags
+    record.setdefault("downloaded_at", now)
+    record.setdefault("updated_at", now)
+    record_id = str(record.get("id") or uuid.uuid4().hex[:16])
+    output_path = str(record.get("output_path") or "")
+    tags_text = " ".join(
+        str(part)
+        for part in [
+            record.get("title"),
+            record.get("artist"),
+            record.get("uploader"),
+            record.get("tagged_artist"),
+            record.get("parsed_artist"),
+            record.get("genre"),
+            record.get("playlist"),
+            record.get("source_url"),
+            record.get("track_id"),
+            *tags,
+        ]
+        if part
+    )
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO metadata_records (
+                id, queue_item_id, output_path, title, artist, uploader, tagged_artist,
+                parsed_artist, genre, tags_json, tags_text, description, source_url,
+                track_id, playlist, album_or_playlist_title, artwork_url,
+                created_or_release_date, downloaded_at, quality_result_json,
+                metadata_json, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(queue_item_id, output_path) DO UPDATE SET
+                title = excluded.title,
+                artist = excluded.artist,
+                uploader = excluded.uploader,
+                tagged_artist = excluded.tagged_artist,
+                parsed_artist = excluded.parsed_artist,
+                genre = excluded.genre,
+                tags_json = excluded.tags_json,
+                tags_text = excluded.tags_text,
+                description = excluded.description,
+                source_url = excluded.source_url,
+                track_id = excluded.track_id,
+                playlist = excluded.playlist,
+                album_or_playlist_title = excluded.album_or_playlist_title,
+                artwork_url = excluded.artwork_url,
+                created_or_release_date = excluded.created_or_release_date,
+                downloaded_at = excluded.downloaded_at,
+                quality_result_json = excluded.quality_result_json,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record_id,
+                queue_item_id,
+                output_path,
+                record.get("title"),
+                record.get("artist"),
+                record.get("uploader"),
+                record.get("tagged_artist"),
+                record.get("parsed_artist"),
+                record.get("genre"),
+                json.dumps(tags),
+                tags_text,
+                record.get("description"),
+                record.get("source_url"),
+                record.get("track_id"),
+                record.get("playlist"),
+                record.get("album_or_playlist_title"),
+                record.get("artwork_url"),
+                record.get("created_or_release_date"),
+                float(record.get("downloaded_at") or now),
+                json.dumps(record.get("quality_result") or {}),
+                json.dumps(record, default=str),
+                now,
+            ),
+        )
+        conn.commit()
+    record["id"] = record_id
+    return record
 
 
 def row_to_item(row: sqlite3.Row) -> QueueItem:
@@ -336,6 +560,7 @@ def row_to_item(row: sqlite3.Row) -> QueueItem:
         log_path=Path(row["log_path"] or LOG_DIR / f"{row['id']}.log"),
         files=json_loads(row["files_json"], []),
         summary=json_loads(row["summary_json"], {}),
+        metadata_records=metadata_for_queue(row["id"]),
     )
 
 
@@ -424,9 +649,27 @@ def history_query(status: str = "All", search: str = "", page: int = 1, page_siz
     page_size = min(100, max(1, page_size))
     where, params = history_status_filter(status)
     if search.strip():
-        where += " AND (target LIKE ? OR target_url LIKE ? OR preset_name LIKE ? OR output_file LIKE ? OR last_error LIKE ?)"
-        needle = f"%{search.strip()}%"
-        params.extend([needle, needle, needle, needle, needle])
+        if load_settings().get("search_tags_enabled", True):
+            where += """
+                AND (
+                    target LIKE ? OR target_url LIKE ? OR preset_name LIKE ? OR output_file LIKE ? OR last_error LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM metadata_records
+                        WHERE metadata_records.queue_item_id = queue_items.id
+                        AND (
+                            title LIKE ? OR artist LIKE ? OR uploader LIKE ? OR tagged_artist LIKE ?
+                            OR parsed_artist LIKE ? OR genre LIKE ? OR tags_text LIKE ? OR playlist LIKE ?
+                            OR source_url LIKE ? OR track_id LIKE ? OR album_or_playlist_title LIKE ?
+                        )
+                    )
+                )
+            """
+            needle = f"%{search.strip()}%"
+            params.extend([needle] * 16)
+        else:
+            where += " AND (target LIKE ? OR target_url LIKE ? OR preset_name LIKE ? OR output_file LIKE ? OR last_error LIKE ?)"
+            needle = f"%{search.strip()}%"
+            params.extend([needle] * 5)
     offset = (page - 1) * page_size
     with db_connect() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM queue_items WHERE {where}", params).fetchone()[0]
@@ -466,6 +709,7 @@ def history_row_public(row: sqlite3.Row) -> dict[str, Any]:
         "track_id": row["track_id"],
         "last_error": row["last_error"],
         "summary": json_loads(row["summary_json"], {}),
+        "metadata_records": metadata_for_queue(row["id"], limit=8),
     }
 
 
@@ -474,6 +718,7 @@ def app_stats() -> dict[str, Any]:
     with db_connect() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count FROM queue_items GROUP BY status").fetchall()
         history_count = conn.execute("SELECT COUNT(*) FROM queue_items").fetchone()[0]
+        metadata_count = conn.execute("SELECT COUNT(*) FROM metadata_records").fetchone()[0]
         likes = conn.execute(
             """
             SELECT * FROM queue_items
@@ -498,6 +743,7 @@ def app_stats() -> dict[str, Any]:
     running = counts.get("Running", 0)
     return {
         "history_count": history_count,
+        "metadata_count": metadata_count,
         "archive_count": archive_count(),
         "total_processed": downloaded + failed + skipped,
         "downloaded": downloaded,
@@ -537,6 +783,13 @@ def load_settings() -> dict[str, Any]:
             SETTINGS_PATH.replace(backup)
     if settings.get("default_preset") not in PRESETS:
         settings["default_preset"] = "best-original"
+    if settings.get("organization_mode") not in ORGANIZATION_MODES:
+        settings["organization_mode"] = "library-clean"
+    if settings.get("artist_metadata_priority") not in ARTIST_PRIORITY_MODES:
+        settings["artist_metadata_priority"] = "smart-auto"
+    if "use_playlist_folders" not in settings:
+        settings["use_playlist_folders"] = not bool(settings.get("no_playlist_folder"))
+    settings["no_playlist_folder"] = not bool(settings.get("use_playlist_folders", True))
     try:
         settings["max_concurrent_downloads"] = max(1, int(settings.get("max_concurrent_downloads") or 1))
     except (TypeError, ValueError):
@@ -572,6 +825,9 @@ def public_settings() -> dict[str, Any]:
             "archive_path": str(ARCHIVE_PATH),
             "history_path": str(DB_PATH),
             "logs_dir": str(LOG_DIR),
+            "organization_modes": ORGANIZATION_MODES,
+            "artist_priority_modes": ARTIST_PRIORITY_MODES,
+            "organization_preview": organization_preview(settings),
         },
     )
     return public
@@ -612,16 +868,137 @@ def scdl_command() -> str:
 
 
 def safe_path_component(value: str) -> str:
-    clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", value).strip(" .")
+    clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(value or "")).strip(" .")
     return clean[:80] or "soundcloud"
 
 
-def artist_download_dir(target: str) -> Path:
+def safe_filename_stem(value: str, fallback: str = "track", max_length: int = 120) -> str:
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "")).strip(" .")
+    clean = re.sub(r"\s+", " ", clean)
+    return clean[:max_length].rstrip(" .") or fallback
+
+
+def normalize_tags(value: Any) -> list[str]:
+    raw: list[Any]
+    if value is None:
+        raw = []
+    elif isinstance(value, str):
+        quoted = re.findall(r'"([^"]+)"', value)
+        raw = quoted if quoted else re.split(r"[,\n;]+|\s{2,}", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = [value]
+    tags: list[str] = []
+    seen: set[str] = set()
+    for part in raw:
+        tag = str(part or "").strip().strip("#")
+        if not tag:
+            continue
+        lowered = tag.lower()
+        if lowered not in seen:
+            tags.append(tag[:80])
+            seen.add(lowered)
+    return tags[:80]
+
+
+def source_slug(target: str) -> str:
+    if target == "me likes":
+        return "likes"
     parsed = urlparse(target)
-    artist = safe_path_component(parsed.path.strip("/").split("/", 1)[0])
-    path = DOWNLOAD_DIR / artist
+    parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+    return parts[0] if parts else "soundcloud"
+
+
+def source_type_for(preset_id: str, target: str) -> str:
+    if preset_id == "likes-best" or target == "me likes":
+        return "likes"
+    parsed = urlparse(target)
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if "sets" in parts or preset_id == "playlist-best":
+        return "playlist"
+    if len(parts) == 1:
+        return "profile"
+    return "single"
+
+
+def is_playlist_target(preset_id: str, target: str) -> bool:
+    return source_type_for(preset_id, target) == "playlist"
+
+
+def use_playlist_folders(settings: dict[str, Any]) -> bool:
+    return bool(settings.get("use_playlist_folders", not settings.get("no_playlist_folder")))
+
+
+def organization_download_dir(preset_id: str, target: str, settings: dict[str, Any]) -> Path:
+    mode = str(settings.get("organization_mode") or "library-clean")
+    source_type = source_type_for(preset_id, target)
+    if mode in {"scdl-default", "flat"}:
+        path = DOWNLOAD_DIR
+    elif mode == "by-artist":
+        path = DOWNLOAD_DIR / "Artists"
+    elif mode == "by-playlist":
+        path = DOWNLOAD_DIR / ("Playlists" if source_type == "playlist" else "Singles")
+    elif mode == "by-source-type":
+        path = DOWNLOAD_DIR / {
+            "likes": "Likes",
+            "playlist": "Playlists",
+            "profile": "Profiles",
+            "single": "Singles",
+        }.get(source_type, "Unknown")
+    else:
+        path = DOWNLOAD_DIR / {
+            "likes": "Likes" if settings.get("put_likes_in_likes_folder", True) else "Artists",
+            "playlist": "Playlists",
+            "profile": "Artists",
+            "single": "Artists" if not settings.get("put_singles_in_singles_folder", True) else "Singles",
+        }.get(source_type, "Unknown")
     path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
+
+
+def scdl_default_name_format(settings: dict[str, Any]) -> str:
+    parts = []
+    if settings.get("include_upload_date_in_filename"):
+        parts.append("{timestamp}")
+    parts.append("{user[username]} - {title}")
+    if settings.get("include_track_id_in_filename"):
+        parts[-1] = parts[-1] + " [{id}]"
+    return " - ".join(parts)
+
+
+def scdl_default_playlist_name_format(settings: dict[str, Any]) -> str:
+    parts = []
+    if settings.get("include_upload_date_in_filename"):
+        parts.append("{timestamp}")
+    parts.append("{playlist[tracknumber]} - {user[username]} - {title}")
+    if settings.get("include_track_id_in_filename"):
+        parts[-1] = parts[-1] + " [{id}]"
+    return " - ".join(parts)
+
+
+def organization_preview(settings: dict[str, Any]) -> list[str]:
+    mode = str(settings.get("organization_mode") or "library-clean")
+    if mode == "flat":
+        return ["J Dilla - Song Title.flac", "Artist - Track.opus", "Uploader - DJ Edit.mp3"]
+    if mode == "by-artist":
+        return ["Artists/J Dilla/Song Title.flac", "Artists/Artist/Track.opus"]
+    if mode == "by-playlist":
+        return ["Playlists/Beat Tape/001 - Artist - Track.opus", "Singles/Artist - Track.mp3"]
+    if mode == "by-source-type":
+        return [
+            "Likes/J Dilla/Song Title.flac",
+            "Playlists/Beat Tape/001 - Artist - Track.opus",
+            "Singles/Artist/Track.mp3",
+            "Profiles/Profile Name/Upload Title.m4a",
+        ]
+    if mode == "scdl-default":
+        return ["scdl chooses the original output folders and filenames"]
+    return [
+        "Likes/J Dilla/Song Title.flac",
+        "Playlists/Beat Tape/001 - Artist - Track.opus",
+        "Artists/Artist/Track.mp3",
+    ]
 
 
 def mask_command(command: list[str], token: str = "") -> list[str]:
@@ -676,24 +1053,27 @@ def build_scdl_args(
         should_use_archive = True
 
     if preset.downloads:
-        target_download_dir = DOWNLOAD_DIR
-        if settings.get("artist_folders") and preset.needs_url:
-            target_download_dir = artist_download_dir(target)
+        target_download_dir = organization_download_dir(preset.id, target, settings)
         args.extend(["--path", str(target_download_dir)])
         if should_use_archive:
             args.extend(["--download-archive", str(ARCHIVE_PATH)])
         args.extend(["-c", "--retries", "3"])
 
-        name_format = str(settings.get("name_format") or "").strip()
+        name_format = str(settings.get("name_format") or "").strip() or scdl_default_name_format(settings)
         if name_format:
             args.extend(["--name-format", name_format])
 
-        playlist_format = str(settings.get("playlist_name_format") or "").strip()
+        playlist_format = str(settings.get("playlist_name_format") or "").strip() or scdl_default_playlist_name_format(settings)
         if playlist_format:
             args.extend(["--playlist-name-format", playlist_format])
 
-        if settings.get("no_playlist_folder"):
+        if not use_playlist_folders(settings):
             args.append("--no-playlist-folder")
+        force_requested = settings.get("force_metadata") or "--force-metadata" in args
+        if settings.get("preserve_original_metadata") and not force_requested:
+            args.append("--original-metadata")
+        if settings.get("force_metadata") and "--force-metadata" not in args:
+            args.append("--force-metadata")
         if settings.get("original_art"):
             args.append("--original-art")
         if settings.get("add_description"):
@@ -736,7 +1116,7 @@ def file_info(path: Path) -> dict[str, Any]:
     stat = path.stat()
     relative = path.relative_to(DOWNLOAD_DIR).as_posix()
     folder = path.parent.relative_to(DOWNLOAD_DIR).as_posix()
-    return {
+    info = {
         "name": path.name,
         "extension": path.suffix.lower().lstrip(".") or "file",
         "size": stat.st_size,
@@ -745,6 +1125,386 @@ def file_info(path: Path) -> dict[str, Any]:
         "folder": "." if folder == "." else folder,
         "path": relative,
     }
+    metadata = metadata_by_output_path(relative)
+    if metadata:
+        info["metadata"] = metadata
+    return info
+
+
+def first_tag_value(tags: Any, keys: list[str]) -> Optional[str]:
+    if not tags:
+        return None
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except Exception:
+            value = None
+        if isinstance(value, (list, tuple)) and value:
+            return str(value[0]).strip() or None
+        if value:
+            return str(value).strip() or None
+    return None
+
+
+def read_embedded_metadata(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return {}
+    try:
+        from mutagen import File as MutagenFile
+
+        easy = MutagenFile(path, easy=True)
+        raw = MutagenFile(path, easy=False)
+    except Exception:
+        return {}
+    easy_tags = getattr(easy, "tags", None)
+    raw_tags = getattr(raw, "tags", None)
+    tags = normalize_tags(
+        first_tag_value(easy_tags, ["keywords", "grouping", "genre"])
+        or first_tag_value(raw_tags, ["SOUNDCLOUD_TAGS", "TXXX:SOUNDCLOUD_TAGS"])
+    )
+    return {
+        "title": first_tag_value(easy_tags, ["title"]) or first_tag_value(raw_tags, ["TIT2", "\xa9nam"]),
+        "tagged_artist": first_tag_value(easy_tags, ["artist"]) or first_tag_value(raw_tags, ["TPE1", "\xa9ART"]),
+        "album_artist": first_tag_value(easy_tags, ["albumartist"]) or first_tag_value(raw_tags, ["TPE2", "aART"]),
+        "album_or_playlist_title": first_tag_value(easy_tags, ["album"]) or first_tag_value(raw_tags, ["TALB", "\xa9alb"]),
+        "genre": first_tag_value(easy_tags, ["genre"]) or first_tag_value(raw_tags, ["TCON", "\xa9gen"]),
+        "description": first_tag_value(easy_tags, ["description", "comment"]) or first_tag_value(raw_tags, ["COMM", "\xa9cmt"]),
+        "source_url": first_tag_value(easy_tags, ["website", "url"]) or first_tag_value(raw_tags, ["WOAF", "WWWAUDIOFILE"]),
+        "created_or_release_date": first_tag_value(easy_tags, ["date"]) or first_tag_value(raw_tags, ["TDRC", "TDAT", "\xa9day"]),
+        "track_number": first_tag_value(easy_tags, ["tracknumber"]) or first_tag_value(raw_tags, ["TRCK", "trkn"]),
+        "tags": tags,
+    }
+
+
+def parse_artist_title(value: str) -> dict[str, Any]:
+    title = str(value or "").strip()
+    if not title:
+        return {"parsed_artist": None, "clean_title": None, "candidates": []}
+    candidates: list[str] = []
+    clean_title = title
+    delimiter_match = re.match(r"^\s*(?P<artist>.{2,90}?)\s+(?:-|\u2013|\u2014|:)\s+(?P<title>.{2,180})\s*$", title)
+    if delimiter_match:
+        candidates.append(delimiter_match.group("artist").strip())
+        clean_title = delimiter_match.group("title").strip()
+    remix_match = re.search(
+        r"[\(\[]\s*(?P<artist>[A-Za-z0-9&.,' _-]{2,80}?)\s+(?:remix|edit|refix|bootleg|flip|dub|rework|mashup)\s*[\)\]]",
+        title,
+        re.IGNORECASE,
+    )
+    if remix_match:
+        candidates.append(remix_match.group("artist").strip())
+    featured_match = re.search(r"\b(?:w/|with|feat\.?|ft\.?)\s+(?P<artist>[A-Za-z0-9&.,' _-]{2,80})", title, re.IGNORECASE)
+    if featured_match:
+        candidates.append(featured_match.group("artist").strip())
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip(" -:[]()")
+        if candidate and candidate.lower() not in seen:
+            normalized.append(candidate)
+            seen.add(candidate.lower())
+    return {
+        "parsed_artist": normalized[0] if normalized else None,
+        "clean_title": clean_title,
+        "candidates": normalized,
+    }
+
+
+def choose_artist(
+    *,
+    priority: str,
+    tagged_artist: Optional[str],
+    uploader: Optional[str],
+    parsed_artist: Optional[str],
+) -> str:
+    values = {
+        "tagged": tagged_artist,
+        "uploader": uploader,
+        "parsed": parsed_artist,
+    }
+    if priority == "uploader-first":
+        order = ["uploader", "tagged", "parsed"]
+    elif priority == "tagged-first":
+        order = ["tagged", "parsed", "uploader"]
+    elif priority == "title-parse-first":
+        order = ["parsed", "tagged", "uploader"]
+    else:
+        order = ["tagged", "uploader", "parsed"]
+    for key in order:
+        value = str(values.get(key) or "").strip()
+        if value:
+            return value
+    return "Unknown Artist"
+
+
+def resolve_source_metadata(target: str) -> dict[str, Any]:
+    if target == "me likes" or not target.startswith(("http://", "https://")):
+        return {}
+    try:
+        from soundcloud import SoundCloud
+
+        client = SoundCloud(None, get_auth_token() or None)
+        item = client.resolve(target)
+    except Exception:
+        return {}
+    if item is None:
+        return {}
+    user = getattr(item, "user", None)
+    created_at = getattr(item, "created_at", None)
+    tags = normalize_tags(getattr(item, "tag_list", None))
+    publisher = getattr(item, "publisher_metadata", None) or {}
+    if isinstance(publisher, dict):
+        publisher_artist = publisher.get("artist") or publisher.get("writer_composer")
+    else:
+        publisher_artist = getattr(publisher, "artist", None) or getattr(publisher, "writer_composer", None)
+    playlist_title = getattr(item, "title", None) if "sets" in urlparse(target).path else None
+    return {
+        "title": getattr(item, "title", None),
+        "uploader": getattr(user, "username", None),
+        "tagged_artist": publisher_artist,
+        "genre": getattr(item, "genre", None),
+        "tags": tags,
+        "description": getattr(item, "description", None),
+        "source_url": getattr(item, "permalink_url", None) or target,
+        "track_id": str(getattr(item, "id", "") or "") or None,
+        "playlist": playlist_title,
+        "album_or_playlist_title": playlist_title,
+        "artwork_url": getattr(item, "artwork_url", None),
+        "created_or_release_date": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or "") or None,
+    }
+
+
+def infer_title_from_path(path: Path) -> str:
+    stem = path.stem
+    stem = re.sub(r"^\d{1,4}\s*-\s*", "", stem)
+    return stem.strip() or path.stem
+
+
+def build_file_metadata(
+    path: Path,
+    item: QueueItem,
+    source_metadata: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    embedded = read_embedded_metadata(path)
+    source_type = source_type_for(item.preset_id, item.target_url)
+    source_title = source_metadata.get("title") if source_type in {"single", "likes"} else None
+    inferred_title = embedded.get("title") or source_title or infer_title_from_path(path)
+    parsed = parse_artist_title(inferred_title) if settings.get("parse_artist_from_title", True) else {}
+    uploader = source_metadata.get("uploader") or source_slug(item.target_url)
+    tagged_artist = embedded.get("tagged_artist") or source_metadata.get("tagged_artist")
+    parsed_artist = parsed.get("parsed_artist")
+    artist = choose_artist(
+        priority=str(settings.get("artist_metadata_priority") or "smart-auto"),
+        tagged_artist=tagged_artist,
+        uploader=uploader,
+        parsed_artist=parsed_artist,
+    )
+    tags = normalize_tags([*normalize_tags(source_metadata.get("tags")), *normalize_tags(embedded.get("tags")), source_metadata.get("genre"), embedded.get("genre")])
+    playlist = source_metadata.get("playlist")
+    if not playlist and source_type == "playlist":
+        try:
+            playlist = next(part for part in path.relative_to(DOWNLOAD_DIR).parts if part not in {"Playlists", "Singles", "Artists", "Likes"})
+        except Exception:
+            playlist = None
+    relative = path.relative_to(DOWNLOAD_DIR).as_posix()
+    return {
+        "output_path": relative,
+        "title": parsed.get("clean_title") or inferred_title,
+        "artist": artist,
+        "uploader": uploader,
+        "tagged_artist": tagged_artist,
+        "parsed_artist": parsed_artist,
+        "artist_candidates": parsed.get("candidates") or [],
+        "genre": embedded.get("genre") or source_metadata.get("genre"),
+        "tags": tags,
+        "description": embedded.get("description") or source_metadata.get("description"),
+        "source_url": embedded.get("source_url") or source_metadata.get("source_url") or (item.target_url if item.target_url != "me likes" else None),
+        "track_id": source_metadata.get("track_id"),
+        "playlist": playlist,
+        "album_or_playlist_title": embedded.get("album_or_playlist_title") or source_metadata.get("album_or_playlist_title"),
+        "artwork_url": source_metadata.get("artwork_url"),
+        "created_or_release_date": embedded.get("created_or_release_date") or source_metadata.get("created_or_release_date"),
+        "track_number": embedded.get("track_number"),
+        "source_type": source_type,
+        "downloaded_at": time.time(),
+        "quality_result": item.summary,
+    }
+
+
+def set_easy_tag(tags: Any, key: str, value: Any, *, force: bool) -> None:
+    if value is None or value == "":
+        return
+    try:
+        current = tags.get(key)
+        if force or not current:
+            tags[key] = [str(value)]
+    except Exception:
+        return
+
+
+def embed_metadata(path: Path, record: dict[str, Any], settings: dict[str, Any]) -> None:
+    if path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        return
+    if audio is None:
+        return
+    if audio.tags is None:
+        try:
+            audio.add_tags()
+        except Exception:
+            return
+    force = bool(settings.get("force_metadata")) or not bool(settings.get("preserve_original_metadata", True))
+    set_easy_tag(audio.tags, "title", record.get("title"), force=force)
+    set_easy_tag(audio.tags, "artist", record.get("artist"), force=force)
+    set_easy_tag(audio.tags, "albumartist", record.get("uploader"), force=force)
+    if record.get("playlist") or record.get("album_or_playlist_title"):
+        set_easy_tag(audio.tags, "album", record.get("playlist") or record.get("album_or_playlist_title"), force=force)
+    set_easy_tag(audio.tags, "genre", record.get("genre"), force=force)
+    set_easy_tag(audio.tags, "date", record.get("created_or_release_date"), force=force)
+    comment_parts = [record.get("description"), record.get("source_url")]
+    if settings.get("embed_soundcloud_tags", True) and record.get("tags"):
+        comment_parts.append("Tags: " + ", ".join(record["tags"]))
+    set_easy_tag(audio.tags, "comment", "\n".join(str(part) for part in comment_parts if part), force=force)
+    try:
+        audio.save()
+    except Exception:
+        return
+
+
+def playlist_index(record: dict[str, Any]) -> str:
+    raw = str(record.get("track_number") or "").split("/", 1)[0]
+    digits = re.sub(r"\D+", "", raw)
+    return digits.zfill(3) if digits else "001"
+
+
+def dated_prefix(record: dict[str, Any]) -> str:
+    raw = str(record.get("created_or_release_date") or "")
+    match = re.search(r"\d{4}-\d{2}-\d{2}", raw)
+    return f"{match.group(0)} - " if match else ""
+
+
+def destination_for_record(path: Path, record: dict[str, Any], item: QueueItem, settings: dict[str, Any]) -> Path:
+    mode = str(settings.get("organization_mode") or "library-clean")
+    if mode == "scdl-default":
+        return path
+    source_type = record.get("source_type") or source_type_for(item.preset_id, item.target_url)
+    artist = safe_path_component(record.get("artist") or record.get("uploader") or "Unknown Artist")
+    title = safe_filename_stem(record.get("title") or path.stem, fallback="Track")
+    playlist = safe_path_component(record.get("playlist") or record.get("album_or_playlist_title") or "Unknown Playlist")
+    uploader = safe_path_component(record.get("uploader") or "Unknown")
+    track_id = safe_filename_stem(record.get("track_id") or "", fallback="", max_length=32)
+    date_prefix = dated_prefix(record) if settings.get("include_upload_date_in_filename") else ""
+    id_suffix = f" [{track_id}]" if settings.get("include_track_id_in_filename") and track_id else ""
+    ext = path.suffix
+    if source_type == "playlist":
+        stem = f"{playlist_index(record)} - {artist} - {title}{id_suffix}"
+    elif mode == "by-playlist":
+        stem = f"{date_prefix}{artist} - {title}{id_suffix}"
+    elif mode == "flat":
+        stem = f"{date_prefix}{artist} - {title}{id_suffix}"
+    else:
+        stem = f"{date_prefix}{title}{id_suffix}"
+    filename = safe_filename_stem(stem, fallback="Track", max_length=150) + ext
+
+    if mode == "flat":
+        folder = DOWNLOAD_DIR
+    elif mode == "by-artist":
+        folder = DOWNLOAD_DIR / "Artists" / artist
+    elif mode == "by-playlist":
+        folder = DOWNLOAD_DIR / "Playlists" / playlist if source_type == "playlist" and use_playlist_folders(settings) else DOWNLOAD_DIR / "Singles"
+    elif mode == "by-source-type":
+        if source_type == "likes":
+            folder = DOWNLOAD_DIR / "Likes" / artist
+        elif source_type == "playlist":
+            folder = DOWNLOAD_DIR / "Playlists" / playlist if use_playlist_folders(settings) else DOWNLOAD_DIR / "Playlists"
+        elif source_type == "profile":
+            folder = DOWNLOAD_DIR / "Profiles" / uploader
+        else:
+            folder = DOWNLOAD_DIR / "Singles" / artist
+    else:
+        if source_type == "likes":
+            folder = DOWNLOAD_DIR / "Likes" / artist if settings.get("put_likes_in_likes_folder", True) else DOWNLOAD_DIR / "Artists" / artist
+        elif source_type == "playlist":
+            folder = DOWNLOAD_DIR / "Playlists" / playlist if use_playlist_folders(settings) else DOWNLOAD_DIR / "Playlists"
+        elif artist == "Unknown Artist":
+            folder = DOWNLOAD_DIR / "Unknown" / uploader
+        elif source_type == "single" and settings.get("put_singles_in_singles_folder", True):
+            folder = DOWNLOAD_DIR / "Singles" / artist
+        else:
+            folder = DOWNLOAD_DIR / "Artists" / artist
+    return folder / filename
+
+
+def unique_destination(path: Path, record: dict[str, Any], item_id: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        return path
+    track_id = safe_filename_stem(record.get("track_id") or "", fallback="", max_length=24)
+    suffix = track_id or item_id[:8] or uuid.uuid4().hex[:8]
+    candidate = path.with_name(f"{path.stem} [{suffix}]{path.suffix}")
+    counter = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} [{suffix}-{counter}]{path.suffix}")
+        counter += 1
+    return candidate
+
+
+def move_related_files(source: Path, destination: Path) -> None:
+    for related in source.parent.glob(source.stem + ".*"):
+        if related == source or related.suffix.lower() not in RELATED_FILE_EXTENSIONS:
+            continue
+        target = destination.with_suffix(related.suffix)
+        target = unique_destination(target, {"track_id": ""}, uuid.uuid4().hex[:8])
+        try:
+            shutil.move(str(related), str(target))
+        except OSError:
+            continue
+
+
+def write_sidecar(record: dict[str, Any], path: Path) -> None:
+    sidecar = path.with_suffix(path.suffix + ".json")
+    sidecar.write_text(json.dumps(record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def process_downloaded_metadata(
+    item: QueueItem,
+    source_metadata: dict[str, Any],
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    processed_files: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for file in item.files:
+        try:
+            path = (DOWNLOAD_DIR / file["path"]).resolve()
+            path.relative_to(DOWNLOAD_DIR)
+        except Exception:
+            continue
+        if not path.exists():
+            continue
+        if path.suffix.lower() not in AUDIO_EXTENSIONS:
+            processed_files.append(file_info(path))
+            continue
+        record = build_file_metadata(path, item, source_metadata, settings)
+        destination = destination_for_record(path, record, item, settings)
+        destination = unique_destination(destination, record, item.id) if destination != path else path
+        if destination != path:
+            move_related_files(path, destination)
+            shutil.move(str(path), str(destination))
+            path = destination
+            record["output_path"] = path.relative_to(DOWNLOAD_DIR).as_posix()
+        embed_metadata(path, record, settings)
+        if settings.get("save_sidecar_json"):
+            write_sidecar(record, path)
+        saved = upsert_metadata_record(item.id, record)
+        records.append(saved)
+        processed_files.append(file_info(path))
+    return processed_files, records
 
 
 def new_or_changed_files(before: dict[str, tuple[int, int]]) -> list[dict[str, Any]]:
@@ -1074,6 +1834,14 @@ class QueueManager:
             if auth_error:
                 item.summary.setdefault("warnings", []).append("Authentication-related failure detected; queue paused.")
                 item.last_error = item.last_error or "Authentication-related failure detected; queue paused."
+            if item.files:
+                settings = load_settings()
+                source_metadata = await asyncio.to_thread(resolve_source_metadata, item.target_url)
+                item.files, item.metadata_records = process_downloaded_metadata(item, source_metadata, settings)
+                if item.files:
+                    item.output_file = item.files[0].get("path")
+                item.summary["files"] = item.files
+                item.summary["metadata_records"] = item.metadata_records[:20]
             persist_item(item)
             async with self.lock:
                 if auth_error:
@@ -1330,6 +2098,13 @@ async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
             settings[key] = max(0.0, float(value))
         elif key == "default_preset" and value in PRESETS:
             settings[key] = value
+        elif key == "organization_mode" and value in ORGANIZATION_MODES:
+            settings[key] = value
+        elif key == "artist_metadata_priority" and value in ARTIST_PRIORITY_MODES:
+            settings[key] = value
+        elif key == "use_playlist_folders" and value is not None:
+            settings[key] = bool(value)
+            settings["no_playlist_folder"] = not bool(value)
         elif key != "default_preset":
             settings[key] = value
     save_settings(settings)
