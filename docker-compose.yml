@@ -5,7 +5,6 @@ services:
       dockerfile: Dockerfile
     container_name: scdl_web
     user: "0:0"
-    entrypoint: []
     working_dir: /app
     command:
       - python
@@ -22,12 +21,13 @@ services:
       - PUID=1001
       - PGID=100
       - TZ=America/New_York
+      - PYTHONPATH=/app
       - DOWNLOAD_DIR=/downloads
       - CONFIG_DIR=/config
       - DEFAULT_PRESET=best-original
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
-      - DOWNLOAD_DELAY_SECONDS=2
+      - DOWNLOAD_DELAY_SECONDS=10
       - MAX_RATE_LIMIT_BACKOFF_SECONDS=900
       - MAX_CONSECUTIVE_RATE_LIMITS=8
       - DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads

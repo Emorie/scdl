@@ -169,7 +169,7 @@ If a SoundCloud auth token is configured, the web app appends
 6. Open:
 
    ```text
-   http://NAS-IP:8090
+   http://NAS-IP:8091
    ```
 
 7. Paste a SoundCloud URL.
@@ -182,8 +182,12 @@ If a SoundCloud auth token is configured, the web app appends
 ```yaml
 services:
   scdl-web:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: scdl_web
+    user: "0:0"
+    working_dir: /app
     command:
       - python
       - -m
@@ -194,17 +198,18 @@ services:
       - --port
       - "8090"
     ports:
-      - "8090:8090"
+      - "8091:8090"
     environment:
       - PUID=1001
       - PGID=100
       - TZ=America/New_York
+      - PYTHONPATH=/app
       - DOWNLOAD_DIR=/downloads
       - CONFIG_DIR=/config
       - DEFAULT_PRESET=best-original
       - SOUNDCLOUD_AUTH_TOKEN=
       - MAX_CONCURRENT_DOWNLOADS=1
-      - DOWNLOAD_DELAY_SECONDS=2
+      - DOWNLOAD_DELAY_SECONDS=10
       - MAX_RATE_LIMIT_BACKOFF_SECONDS=900
       - MAX_CONSECUTIVE_RATE_LIMITS=8
       - DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads
@@ -395,9 +400,9 @@ Resume uses two layers:
 Keep both `/config` and `/downloads` mounted to persistent NAS folders. If the
 container stops or the NAS reboots, start Likes Sync again; `scdl` reloads the
 archive and skips completed tracks. Use `Retry Failed Only` for failed Likes
-Sync jobs. For 20k+ likes, keep `MAX_CONCURRENT_DOWNLOADS=1`; the default
-`DOWNLOAD_DELAY_SECONDS=2` is intentionally rate-limit friendly for normal queue
-items.
+Sync jobs. For 20k+ likes, keep `MAX_CONCURRENT_DOWNLOADS=1`; the Portainer
+compose default uses `DOWNLOAD_DELAY_SECONDS=10` for conservative large-sync
+behavior.
 
 ### Paths
 

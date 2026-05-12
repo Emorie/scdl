@@ -10,4 +10,4 @@ echo "Rebuilding and restarting scdl-web..."
 docker compose up -d --build
 
 echo "Done."
-echo "Open the app at: http://YOUR-NAS-IP:8090"
+echo "Open the app at: http://YOUR-NAS-IP:8091"

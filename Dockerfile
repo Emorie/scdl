@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_DIR=/config \
     DEFAULT_PRESET=best-original \
     MAX_CONCURRENT_DOWNLOADS=1 \
-    DOWNLOAD_DELAY_SECONDS=2 \
+    DOWNLOAD_DELAY_SECONDS=10 \
     MAX_RATE_LIMIT_BACKOFF_SECONDS=900 \
     MAX_CONSECUTIVE_RATE_LIMITS=8 \
     DEFAULT_PROFILE_DOWNLOAD_TYPE=uploads \
@@ -16,8 +16,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
-        gosu \
-        tini \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,12 +24,11 @@ COPY . /app
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements-web.txt \
-    && pip install --no-cache-dir -e . \
-    && python -c "import scdl_web.main; assert scdl_web.main.app"
+    && pip install --no-cache-dir -e .
 
-RUN chmod +x /app/docker/entrypoint.sh
+RUN python -c "import scdl_web.main; assert scdl_web.main.app"
+RUN chmod -R a+rX /app
 
 EXPOSE 8090
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]
 CMD ["python", "-m", "uvicorn", "scdl_web.main:app", "--host", "0.0.0.0", "--port", "8090"]
