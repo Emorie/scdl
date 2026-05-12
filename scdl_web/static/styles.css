@@ -385,7 +385,10 @@ button,
 
 .url-inspector,
 .helper-list,
-.rate-limit-note {
+.rate-limit-note,
+.effective-settings,
+.inline-chip,
+.job-settings-line {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -422,6 +425,57 @@ button,
 
 .rate-limit-note span {
   color: #ffedbe;
+}
+
+.slow-safe-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid rgba(244, 185, 66, 0.44);
+  border-radius: var(--radius);
+  background: rgba(244, 185, 66, 0.08);
+}
+
+.slow-safe-toggle {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.slow-safe-toggle strong,
+.slow-safe-toggle small {
+  display: block;
+}
+
+.slow-safe-toggle small {
+  margin-top: 3px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.effective-settings {
+  grid-column: 1 / -1;
+  color: #ffedbe;
+  font-size: 0.82rem;
+}
+
+.inline-chip {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.queue-inline-chip {
+  margin-top: 0;
+}
+
+.job-settings-line {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .stats-grid {
@@ -764,6 +818,7 @@ button,
   }
 
   .form-grid,
+  .slow-safe-card,
   .quality-row,
   .recent-row,
   .history-row,

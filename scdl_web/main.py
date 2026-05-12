@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse, urlunparse
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -86,6 +86,14 @@ PROFILE_PATH_DEFAULTS = {
     "reposts": "reposts",
     "likes": "likes",
 }
+SLOW_SAFE_SETTINGS = {
+    "max_concurrent_downloads": 1,
+    "download_delay_seconds": 10,
+    "max_rate_limit_backoff_seconds": 900,
+    "max_consecutive_rate_limits": 8,
+    "archive_enabled": True,
+    "resume_history_enabled": True,
+}
 
 
 def env_int(name: str, default: int) -> int:
@@ -130,6 +138,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_rate_limit_backoff_seconds": env_int("MAX_RATE_LIMIT_BACKOFF_SECONDS", 900),
     "max_consecutive_rate_limits": env_int("MAX_CONSECUTIVE_RATE_LIMITS", 8),
     "default_profile_download_type": os.environ.get("DEFAULT_PROFILE_DOWNLOAD_TYPE", "uploads"),
+    "slow_safe_mode_enabled": False,
     "default_preset": os.environ.get("DEFAULT_PRESET", "best-original"),
 }
 
@@ -210,6 +219,7 @@ class QueueAddRequest(BaseModel):
     autostart: bool = False
     archive_enabled: Optional[bool] = None
     profile_type: Optional[str] = None
+    slow_safe_mode: Optional[bool] = None
 
 
 class QualityRequest(BaseModel):
@@ -218,6 +228,10 @@ class QualityRequest(BaseModel):
 
 class UrlInfoRequest(BaseModel):
     url: str
+
+
+class LikesSyncRequest(BaseModel):
+    slow_safe_mode: Optional[bool] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -249,6 +263,7 @@ class SettingsUpdate(BaseModel):
     max_rate_limit_backoff_seconds: Optional[int] = None
     max_consecutive_rate_limits: Optional[int] = None
     default_profile_download_type: Optional[str] = None
+    slow_safe_mode_enabled: Optional[bool] = None
     default_preset: Optional[str] = None
 
 
@@ -270,6 +285,8 @@ class QueueItem:
     masked_command: list[str]
     log_path: Path
     archive_enabled: bool
+    slow_safe_mode: bool = False
+    job_settings: dict[str, Any] = field(default_factory=dict)
     is_likes_sync: bool = False
     status: str = "Pending"
     created_at: float = field(default_factory=time.time)
@@ -303,6 +320,8 @@ class QueueItem:
             "job_type": self.job_type,
             "command": self.masked_command,
             "archive_enabled": self.archive_enabled,
+            "slow_safe_mode": self.slow_safe_mode,
+            "job_settings": self.job_settings,
             "is_likes_sync": self.is_likes_sync,
             "status": self.status,
             "created_at": iso_time(self.created_at),
@@ -365,6 +384,8 @@ def init_db() -> None:
                 job_type TEXT NOT NULL DEFAULT 'Download',
                 status TEXT NOT NULL,
                 archive_enabled INTEGER NOT NULL DEFAULT 1,
+                slow_safe_mode INTEGER NOT NULL DEFAULT 0,
+                job_settings_json TEXT NOT NULL DEFAULT '{}',
                 is_likes_sync INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -386,6 +407,8 @@ def init_db() -> None:
         ensure_queue_column(conn, "url_kind", "TEXT NOT NULL DEFAULT 'unknown'")
         ensure_queue_column(conn, "profile_type", "TEXT")
         ensure_queue_column(conn, "job_type", "TEXT NOT NULL DEFAULT 'Download'")
+        ensure_queue_column(conn, "slow_safe_mode", "INTEGER NOT NULL DEFAULT 0")
+        ensure_queue_column(conn, "job_settings_json", "TEXT NOT NULL DEFAULT '{}'")
         ensure_queue_column(conn, "rate_limit_count", "INTEGER NOT NULL DEFAULT 0")
         ensure_queue_column(conn, "last_rate_limit_backoff", "INTEGER")
         ensure_queue_column(conn, "rate_limit_retry_at", "REAL")
@@ -616,6 +639,8 @@ def row_to_item(row: sqlite3.Row) -> QueueItem:
         command=command,
         masked_command=masked,
         archive_enabled=archive_enabled,
+        slow_safe_mode=bool(row["slow_safe_mode"]),
+        job_settings=json_loads(row["job_settings_json"], {}),
         is_likes_sync=bool(row["is_likes_sync"]),
         status=row["status"],
         created_at=row["created_at"],
@@ -642,13 +667,13 @@ def persist_item(item: QueueItem) -> None:
             """
             INSERT INTO queue_items (
                 id, preset_id, preset_name, target, target_url, url_kind, profile_type,
-                job_type, status, archive_enabled,
+                job_type, status, archive_enabled, slow_safe_mode, job_settings_json,
                 is_likes_sync, created_at, updated_at, started_at, finished_at,
                 return_code, log_path, files_json, summary_json, output_file,
                 track_id, last_error, rate_limit_count, last_rate_limit_backoff,
                 rate_limit_retry_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 preset_id = excluded.preset_id,
                 preset_name = excluded.preset_name,
@@ -659,6 +684,8 @@ def persist_item(item: QueueItem) -> None:
                 job_type = excluded.job_type,
                 status = excluded.status,
                 archive_enabled = excluded.archive_enabled,
+                slow_safe_mode = excluded.slow_safe_mode,
+                job_settings_json = excluded.job_settings_json,
                 is_likes_sync = excluded.is_likes_sync,
                 updated_at = excluded.updated_at,
                 started_at = excluded.started_at,
@@ -685,6 +712,8 @@ def persist_item(item: QueueItem) -> None:
                 item.job_type,
                 item.status,
                 int(item.archive_enabled),
+                int(item.slow_safe_mode),
+                json.dumps(item.job_settings),
                 int(item.is_likes_sync),
                 item.created_at,
                 item.updated_at,
@@ -791,6 +820,8 @@ def history_row_public(row: sqlite3.Row) -> dict[str, Any]:
         "job_type": row["job_type"],
         "status": row["status"],
         "archive_enabled": bool(row["archive_enabled"]),
+        "slow_safe_mode": bool(row["slow_safe_mode"]),
+        "job_settings": json_loads(row["job_settings_json"], {}),
         "is_likes_sync": bool(row["is_likes_sync"]),
         "created_at": iso_time(row["created_at"]),
         "updated_at": iso_time(row["updated_at"]),
@@ -907,6 +938,7 @@ def load_settings() -> dict[str, Any]:
         settings["max_consecutive_rate_limits"] = 8
     if settings.get("default_profile_download_type") not in PROFILE_DOWNLOAD_TYPES:
         settings["default_profile_download_type"] = "uploads"
+    settings["slow_safe_mode_enabled"] = bool(settings.get("slow_safe_mode_enabled", False))
     save_settings(settings)
     return settings
 
@@ -916,6 +948,38 @@ def save_settings(settings: dict[str, Any]) -> None:
     safe_settings = dict(DEFAULT_SETTINGS)
     safe_settings.update(settings)
     SETTINGS_PATH.write_text(json.dumps(safe_settings, indent=2), encoding="utf-8")
+
+
+def effective_job_settings(
+    settings: dict[str, Any],
+    *,
+    slow_safe_mode: bool = False,
+    archive_enabled: Optional[bool] = None,
+) -> dict[str, Any]:
+    job_settings = {
+        "max_concurrent_downloads": max(1, int(settings.get("max_concurrent_downloads") or 1)),
+        "download_delay_seconds": max(0.0, float(settings.get("download_delay_seconds") or 0)),
+        "max_rate_limit_backoff_seconds": max(1, int(settings.get("max_rate_limit_backoff_seconds") or 900)),
+        "max_consecutive_rate_limits": max(1, int(settings.get("max_consecutive_rate_limits") or 8)),
+        "archive_enabled": bool(settings.get("archive_enabled", True) if archive_enabled is None else archive_enabled),
+        "resume_history_enabled": True,
+    }
+    if slow_safe_mode:
+        job_settings.update(SLOW_SAFE_SETTINGS)
+    return job_settings
+
+
+def runtime_settings_for_item(item: QueueItem) -> dict[str, Any]:
+    settings = load_settings()
+    runtime = effective_job_settings(
+        settings,
+        slow_safe_mode=item.slow_safe_mode,
+        archive_enabled=item.archive_enabled,
+    )
+    runtime.update({key: value for key, value in item.job_settings.items() if key in runtime})
+    if item.slow_safe_mode:
+        runtime.update(SLOW_SAFE_SETTINGS)
+    return runtime
 
 
 def public_settings() -> dict[str, Any]:
@@ -937,6 +1001,7 @@ def public_settings() -> dict[str, Any]:
             "organization_modes": ORGANIZATION_MODES,
             "artist_priority_modes": ARTIST_PRIORITY_MODES,
             "profile_download_types": PROFILE_DOWNLOAD_TYPES,
+            "slow_safe_settings": SLOW_SAFE_SETTINGS,
             "organization_preview": organization_preview(settings),
         },
     )
@@ -1851,9 +1916,10 @@ def parse_rate_limit_reset(line: str) -> Optional[float]:
 
 
 def rate_limit_message(item: QueueItem) -> str:
+    resume = "Safe to resume later. Already downloaded tracks will be skipped."
     if item.rate_limit_retry_at:
-        return f"SoundCloud rate-limited this job. Safe to resume after: {iso_time(item.rate_limit_retry_at)}"
-    return "SoundCloud rate-limited this job. Try again later. Your downloaded tracks are saved and archive will skip completed tracks."
+        return f"SoundCloud rate-limited this job. Safe to resume after: {iso_time(item.rate_limit_retry_at)}. {resume}"
+    return f"SoundCloud rate-limited this job. Try again later. {resume}"
 
 
 def parse_quality_output(output: str) -> dict[str, Any]:
@@ -1927,6 +1993,18 @@ class QueueManager:
             raise HTTPException(status_code=400, detail="Unknown preset")
         if request.preset == "check-qualities":
             raise HTTPException(status_code=400, detail="Use Check Qualities for this preset")
+        settings = load_settings()
+        slow_safe_mode = bool(
+            request.slow_safe_mode
+            if request.slow_safe_mode is not None
+            else settings.get("slow_safe_mode_enabled", False)
+        )
+        archive_request = True if slow_safe_mode else request.archive_enabled
+        job_settings = effective_job_settings(
+            settings,
+            slow_safe_mode=slow_safe_mode,
+            archive_enabled=archive_request,
+        )
 
         targets = ["me likes"] if not preset.needs_url else split_urls(request.urls)
         if preset.needs_url and not targets:
@@ -1943,7 +2021,7 @@ class QueueManager:
                 command, masked, archive_enabled = build_scdl_args(
                     request.preset,
                     target,
-                    archive_enabled=request.archive_enabled,
+                    archive_enabled=bool(job_settings["archive_enabled"]),
                     profile_type=context["profile_type"],
                 )
                 job_id = uuid.uuid4().hex[:12]
@@ -1960,6 +2038,8 @@ class QueueManager:
                     command=command,
                     masked_command=masked,
                     archive_enabled=archive_enabled,
+                    slow_safe_mode=slow_safe_mode,
+                    job_settings=job_settings,
                     is_likes_sync=is_likes_sync,
                     log_path=LOG_DIR / f"{job_id}.log",
                 )
@@ -1992,21 +2072,34 @@ class QueueManager:
             settings = load_settings()
             max_concurrent = max(1, int(settings["max_concurrent_downloads"]))
             running = [item for item in self.items if item.status == "Running"]
+            if any(item.slow_safe_mode for item in running):
+                return
             available = max_concurrent - len(running)
             pending = [item for item in self.items if item.status == "Pending"]
-            for item in pending[:available]:
+            started = 0
+            for item in pending:
+                if available <= 0:
+                    break
+                if item.slow_safe_mode and (running or started):
+                    break
+                if item.slow_safe_mode:
+                    available = 1
                 item.status = "Running"
                 item.started_at = time.time()
                 item.updated_at = item.started_at
                 persist_item(item)
                 item.task = asyncio.create_task(self.run_item(item))
+                started += 1
+                available -= 1
+                if item.slow_safe_mode:
+                    break
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
 
     async def append_log(self, item: QueueItem, text: str) -> None:
         token = get_auth_token()
-        settings = load_settings()
-        max_backoff = int(settings.get("max_rate_limit_backoff_seconds", 900))
-        max_repeated = int(settings.get("max_consecutive_rate_limits", 8))
+        job_settings = runtime_settings_for_item(item)
+        max_backoff = int(job_settings.get("max_rate_limit_backoff_seconds", 900))
+        max_repeated = int(job_settings.get("max_consecutive_rate_limits", 8))
         clean = mask_text(text, token).replace("\r", "\n")
         lines = clean.splitlines() or [clean]
         with item.log_path.open("a", encoding="utf-8") as handle:
@@ -2057,7 +2150,7 @@ class QueueManager:
                             item.logs.append(pause_line)
                             handle.write(pause_line + "\n")
                             await self.broadcast({"type": "log", "item_id": item.id, "line": pause_line})
-                    resume_line = "Safe to resume later; archive will skip completed tracks."
+                    resume_line = "Safe to resume later. Already downloaded tracks will be skipped."
                     if resume_line not in item.logs[-3:]:
                         item.logs.append(resume_line)
                         handle.write(resume_line + "\n")
@@ -2068,6 +2161,10 @@ class QueueManager:
         before = snapshot_files()
         item.log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if not item.job_settings:
+                item.job_settings = runtime_settings_for_item(item)
+            if item.slow_safe_mode:
+                item.archive_enabled = True
             command, masked, archive_enabled = build_scdl_args(
                 item.preset_id,
                 item.target_url,
@@ -2139,6 +2236,10 @@ class QueueManager:
                     item.return_code = None
                     item.last_error = rate_limit_message(item)
                     item.summary.setdefault("warnings", []).append(item.last_error)
+                    if item.slow_safe_mode:
+                        item.summary.setdefault("warnings", []).append(
+                            "Safe to resume later. Already downloaded tracks will be skipped."
+                        )
                     item.summary["rate_limited"] = True
                     item.summary["retry_after"] = iso_time(item.rate_limit_retry_at)
                     item.summary["last_backoff_seconds"] = item.last_rate_limit_backoff
@@ -2172,7 +2273,7 @@ class QueueManager:
                     self.paused = True
                     self.stop_after_current = False
             await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
-            delay = load_settings().get("download_delay_seconds", 0)
+            delay = runtime_settings_for_item(item).get("download_delay_seconds", 0)
             if delay and not self.paused:
                 await asyncio.sleep(float(delay))
             await self.kick()
@@ -2271,9 +2372,17 @@ class QueueManager:
         await self.broadcast({"type": "snapshot", "queue": await self.snapshot()})
         await self.kick()
 
-    async def start_or_resume_likes_sync(self, retry_failed_only: bool = False) -> QueueItem:
+    async def start_or_resume_likes_sync(
+        self,
+        retry_failed_only: bool = False,
+        slow_safe_mode: Optional[bool] = None,
+    ) -> QueueItem:
         if not get_auth_token():
             raise HTTPException(status_code=400, detail="A SoundCloud auth token is required for My Likes Sync")
+        settings = load_settings()
+        use_slow_safe = bool(
+            slow_safe_mode if slow_safe_mode is not None else settings.get("slow_safe_mode_enabled", False)
+        )
 
         async with self.lock:
             active = next(
@@ -2281,6 +2390,11 @@ class QueueManager:
                 None,
             )
             if active:
+                if use_slow_safe and active.status == "Pending":
+                    active.slow_safe_mode = True
+                    active.archive_enabled = True
+                    active.job_settings = effective_job_settings(settings, slow_safe_mode=True, archive_enabled=True)
+                    persist_item(active)
                 self.paused = False
                 self.stop_after_current = False
                 selected = active
@@ -2314,6 +2428,13 @@ class QueueManager:
             selected.last_rate_limit_backoff = None
             selected.rate_limit_retry_at = None
             selected.rate_limit_pause_requested = False
+            selected.slow_safe_mode = use_slow_safe
+            selected.archive_enabled = True if use_slow_safe else selected.archive_enabled
+            selected.job_settings = effective_job_settings(
+                settings,
+                slow_safe_mode=use_slow_safe,
+                archive_enabled=selected.archive_enabled,
+            )
             selected.updated_at = time.time()
             persist_item(selected)
             async with self.lock:
@@ -2335,6 +2456,7 @@ class QueueManager:
                 preset="likes-best",
                 autostart=True,
                 archive_enabled=True,
+                slow_safe_mode=use_slow_safe,
             ),
         )
         return created[0]
@@ -2451,6 +2573,8 @@ async def update_settings(update: SettingsUpdate) -> dict[str, Any]:
             settings[key] = value
         elif key == "default_profile_download_type" and value in PROFILE_DOWNLOAD_TYPES:
             settings[key] = value
+        elif key == "slow_safe_mode_enabled" and value is not None:
+            settings[key] = bool(value)
         elif key == "organization_mode" and value in ORGANIZATION_MODES:
             settings[key] = value
         elif key == "artist_metadata_priority" and value in ARTIST_PRIORITY_MODES:
@@ -2566,20 +2690,29 @@ async def clear_all(confirm: ConfirmRequest) -> dict[str, Any]:
 
 
 @app.post("/api/likes/start")
-async def start_likes_sync() -> dict[str, Any]:
-    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=False)
+async def start_likes_sync(request: LikesSyncRequest = Body(default_factory=LikesSyncRequest)) -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(
+        retry_failed_only=False,
+        slow_safe_mode=request.slow_safe_mode,
+    )
     return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
 
 
 @app.post("/api/likes/resume")
-async def resume_likes_sync() -> dict[str, Any]:
-    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=False)
+async def resume_likes_sync(request: LikesSyncRequest = Body(default_factory=LikesSyncRequest)) -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(
+        retry_failed_only=False,
+        slow_safe_mode=request.slow_safe_mode,
+    )
     return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
 
 
 @app.post("/api/likes/retry-failed")
-async def retry_failed_likes_sync() -> dict[str, Any]:
-    item = await queue_manager.start_or_resume_likes_sync(retry_failed_only=True)
+async def retry_failed_likes_sync(request: LikesSyncRequest = Body(default_factory=LikesSyncRequest)) -> dict[str, Any]:
+    item = await queue_manager.start_or_resume_likes_sync(
+        retry_failed_only=True,
+        slow_safe_mode=request.slow_safe_mode,
+    )
     return {"item": item.public(), "queue": await queue_manager.snapshot(), "stats": app_stats()}
 
 

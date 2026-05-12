@@ -7,9 +7,17 @@ const state = {
   historyTotal: 0,
   urlInfo: null,
   urlInspectTimer: null,
+  slowSafeMode: false,
 };
 
 const $ = (id) => document.getElementById(id);
+const SLOW_SAFE_SETTINGS = {
+  max_concurrent_downloads: 1,
+  download_delay_seconds: 10,
+  max_rate_limit_backoff_seconds: 900,
+  max_consecutive_rate_limits: 8,
+  archive_enabled: true,
+};
 
 function toast(title, message = "", kind = "info") {
   const node = document.createElement("div");
@@ -59,7 +67,51 @@ function firstUrl() {
 }
 
 function archiveForDownload() {
-  return $("archive-for-download").checked;
+  return slowSafeActive() ? true : $("archive-for-download").checked;
+}
+
+function slowSafeActive() {
+  return !!state.slowSafeMode;
+}
+
+function setSlowSafeMode(value) {
+  state.slowSafeMode = !!value;
+  renderSlowSafeMode();
+}
+
+function slowSafeDetails(settings = SLOW_SAFE_SETTINGS) {
+  const backoffMinutes = Math.round((Number(settings.max_rate_limit_backoff_seconds || 900) / 60) * 10) / 10;
+  return [
+    `Concurrency: ${settings.max_concurrent_downloads || 1}`,
+    `Delay: ${settings.download_delay_seconds || 10} seconds`,
+    `Rate-limit backoff cap: ${backoffMinutes} minutes`,
+    `Pause after: ${settings.max_consecutive_rate_limits || 8} consecutive rate limits`,
+    `Archive: ${settings.archive_enabled === false ? "off" : "enabled"}`,
+  ];
+}
+
+function renderSlowSafeMode() {
+  const active = slowSafeActive();
+  document.querySelectorAll(".job-slow-safe-toggle").forEach((node) => {
+    node.checked = active;
+  });
+  const statusNodes = ["slow-safe-badge", "likes-slow-safe-badge", "queue-slow-safe-badge"];
+  for (const id of statusNodes) {
+    const node = $(id);
+    if (!node) continue;
+    node.textContent = active ? "Slow Safe Mode Active" : "Normal mode";
+    node.className = active ? "pill warn" : "pill neutral";
+  }
+  const details = slowSafeDetails(state.settings.slow_safe_settings || SLOW_SAFE_SETTINGS);
+  const detailNode = $("slow-safe-effective");
+  if (detailNode) {
+    detailNode.innerHTML = details.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
+  }
+  if ($("settings-slow-safe-default")) {
+    $("settings-slow-safe-default").checked = !!state.settings.slow_safe_mode_enabled;
+  }
+  $("archive-for-download").checked = active ? true : !!state.settings.archive_enabled;
+  $("archive-for-download").disabled = active;
 }
 
 function profileTypeLabels() {
@@ -234,6 +286,7 @@ function renderSettings() {
   $("auth-status-badge").textContent = settings.auth_configured ? `Auth: ${settings.auth_source}` : "Auth missing";
   $("auth-status-badge").className = settings.auth_configured ? "pill ok" : "pill warn";
   renderUrlInfo();
+  renderSlowSafeMode();
 }
 
 function statusClass(status) {
@@ -306,7 +359,16 @@ function renderQueueItem(item) {
   const canRetry = ["Failed", "Cancelled", "Skipped", "Done"].includes(item.status) || isRateLimited;
   const canCancel = ["Pending", "Running"].includes(item.status);
   const jobType = item.job_type || item.preset_name;
-  const retryAt = item.rate_limit_retry_at ? `Safe to resume after ${item.rate_limit_retry_at}.` : "Try again later; archive will skip completed tracks.";
+  const jobSettings = item.job_settings || {};
+  const slowSafeLine = item.slow_safe_mode
+    ? `<div class="job-settings-line">
+        <span class="quality-badge flac">Slow Safe Mode</span>
+        <span>Concurrency ${escapeHtml(jobSettings.max_concurrent_downloads || 1)} | Delay ${escapeHtml(jobSettings.download_delay_seconds || 10)}s | Archive ${jobSettings.archive_enabled === false ? "off" : "on"}</span>
+      </div>`
+    : "";
+  const retryAt = item.rate_limit_retry_at
+    ? `Safe to resume after ${item.rate_limit_retry_at}.`
+    : "Safe to resume later. Already downloaded tracks will be skipped.";
   const rateLimitNote = isRateLimited
     ? `<div class="rate-limit-note">
         <strong>SoundCloud rate-limited this job.</strong>
@@ -331,6 +393,7 @@ function renderQueueItem(item) {
         </div>
       </div>
       <div class="progress-shell"><div class="progress-bar"></div></div>
+      ${slowSafeLine}
       ${rateLimitNote}
       <div class="summary-grid">${badges}${files}</div>
       ${metadata.title ? `<p class="metadata-line">${escapeHtml(metadata.artist || metadata.uploader || "Unknown Artist")} - ${escapeHtml(metadata.title)}</p>` : ""}
@@ -483,11 +546,16 @@ function renderHistory(data) {
         ? `${metadata.artist || metadata.uploader || "Unknown Artist"} - ${metadata.title}`
         : item.job_type || item.preset_name;
       const tagLine = [metadata.genre, ...(metadata.tags || []).slice(0, 5)].filter(Boolean).join(", ");
+      const jobSettings = item.job_settings || {};
+      const slowSafeLine = item.slow_safe_mode
+        ? `Slow Safe Mode | Concurrency ${jobSettings.max_concurrent_downloads || 1} | Delay ${jobSettings.download_delay_seconds || 10}s | Archive ${jobSettings.archive_enabled === false ? "off" : "on"}`
+        : "";
       return `
         <div class="history-row">
           <div>
             <strong>${escapeHtml(headline)}</strong>
             <span>${escapeHtml(metadata.output_path || item.target_url || item.target)}</span>
+            ${slowSafeLine ? `<span>${escapeHtml(slowSafeLine)}</span>` : ""}
             ${tagLine ? `<span>${escapeHtml(tagLine)}</span>` : ""}
             ${item.last_error ? `<span>${escapeHtml(item.last_error)}</span>` : ""}
           </div>
@@ -514,6 +582,7 @@ async function loadInitial() {
   ]);
   state.presets = presets.presets;
   state.settings = settings;
+  state.slowSafeMode = !!settings.slow_safe_mode_enabled;
   renderPresets();
   renderSettings();
   renderQueue(queue);
@@ -542,6 +611,7 @@ async function addToQueue(autostart = false) {
       autostart,
       archive_enabled: archiveForDownload(),
       profile_type: info?.is_profile ? currentProfileType() : null,
+      slow_safe_mode: slowSafeActive(),
     }),
   });
   renderQueue(data.queue);
@@ -572,6 +642,7 @@ async function checkQualities() {
 
 async function saveSettings(clearToken = false, options = {}) {
   const tokenValue = $("auth-token").value.trim();
+  const saveSlowDefault = $("settings-slow-safe-default")?.checked;
   const payload = {
     clear_auth_token: clearToken,
     auth_token: clearToken ? "" : tokenValue,
@@ -595,21 +666,40 @@ async function saveSettings(clearToken = false, options = {}) {
     sanitize_filenames: $("sanitize-filenames").checked,
     include_track_id_in_filename: $("include-track-id").checked,
     include_upload_date_in_filename: $("include-upload-date").checked,
-    max_concurrent_downloads: Number($("max-concurrent").value || 1),
-    download_delay_seconds: Number($("download-delay").value || 0),
-    max_rate_limit_backoff_seconds: Number($("max-rate-backoff").value || 900),
-    max_consecutive_rate_limits: Number($("max-consecutive-rate-limits").value || 8),
+    max_concurrent_downloads: saveSlowDefault ? 1 : Number($("max-concurrent").value || 1),
+    download_delay_seconds: saveSlowDefault ? 10 : Number($("download-delay").value || 0),
+    max_rate_limit_backoff_seconds: saveSlowDefault ? 900 : Number($("max-rate-backoff").value || 900),
+    max_consecutive_rate_limits: saveSlowDefault ? 8 : Number($("max-consecutive-rate-limits").value || 8),
     default_profile_download_type: $("default-profile-type").value,
+    slow_safe_mode_enabled: !!saveSlowDefault,
     default_preset: selectedPreset(),
   };
+  if (saveSlowDefault) {
+    payload.archive_enabled = true;
+  }
   state.settings = await api("/api/settings", {
     method: "PUT",
     body: JSON.stringify(payload),
   });
+  if (saveSlowDefault) {
+    state.slowSafeMode = true;
+  }
   renderSettings();
   if (!options.silent) {
     toast("Settings saved", "Future queue items will use the new settings.", "ok");
   }
+}
+
+async function saveSlowSafeDefault() {
+  $("settings-slow-safe-default").checked = true;
+  $("archive-enabled").checked = true;
+  $("max-concurrent").value = "1";
+  $("download-delay").value = "10";
+  $("max-rate-backoff").value = "900";
+  $("max-consecutive-rate-limits").value = "8";
+  await saveSettings(false, { silent: true });
+  setSlowSafeMode(true);
+  toast("Slow Safe Mode saved", "Future jobs default to conservative sync settings.", "ok");
 }
 
 async function refreshRecent() {
@@ -661,6 +751,9 @@ function wireEvents() {
   });
   $("url-input").addEventListener("input", scheduleUrlInspect);
   $("profile-type").addEventListener("change", () => renderUrlInfo());
+  document.querySelectorAll(".job-slow-safe-toggle").forEach((node) => {
+    node.addEventListener("change", () => setSlowSafeMode(node.checked));
+  });
   $("check-button").addEventListener("click", () => checkQualities().catch((error) => toast("Quality check failed", error.message, "bad")));
   $("add-button").addEventListener("click", () => addToQueue(false).catch((error) => toast("Could not add", error.message, "bad")));
   $("start-download-button").addEventListener("click", () => addToQueue(true).catch((error) => toast("Could not start", error.message, "bad")));
@@ -672,7 +765,7 @@ function wireEvents() {
     toast("Stop requested", "Pending work was cancelled; a running item will finish first.", "ok");
   });
   $("likes-start").addEventListener("click", () =>
-    api("/api/likes/resume", { method: "POST", body: "{}" })
+    api("/api/likes/resume", { method: "POST", body: JSON.stringify({ slow_safe_mode: slowSafeActive() }) })
       .then((data) => {
         renderQueue(data.queue);
         renderStats(data.stats);
@@ -681,7 +774,7 @@ function wireEvents() {
       .catch((error) => toast("Likes Sync failed", error.message, "bad")),
   );
   $("likes-retry-failed").addEventListener("click", () =>
-    api("/api/likes/retry-failed", { method: "POST", body: "{}" })
+    api("/api/likes/retry-failed", { method: "POST", body: JSON.stringify({ slow_safe_mode: slowSafeActive() }) })
       .then((data) => {
         renderQueue(data.queue);
         renderStats(data.stats);
@@ -697,6 +790,9 @@ function wireEvents() {
     }),
   );
   $("save-settings").addEventListener("click", () => saveSettings(false).catch((error) => toast("Settings failed", error.message, "bad")));
+  $("save-slow-safe-default").addEventListener("click", () =>
+    saveSlowSafeDefault().catch((error) => toast("Slow Safe save failed", error.message, "bad")),
+  );
   $("organization-mode").addEventListener("change", () => {
     $("organization-preview").innerHTML = previewForMode($("organization-mode").value).map((line) => `<code>${escapeHtml(line)}</code>`).join("");
   });

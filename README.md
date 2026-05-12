@@ -270,6 +270,31 @@ to resume; otherwise, wait and try again later.
 For very large syncs, keep concurrency at `1`. If rate limits happen often,
 increase `DOWNLOAD_DELAY_SECONDS` to `5` or `10` in Docker Compose or Settings.
 
+### Slow Safe Mode
+
+Use `Slow Safe Mode` for 20k+ likes, large profile downloads, or big playlists.
+It is a web-app wrapper mode around the normal `scdl` CLI; it does not change
+the downloader logic.
+
+When enabled for a job, the app uses conservative sync settings:
+
+- Concurrency: `1`
+- Delay between downloads: `10` seconds
+- Rate-limit backoff cap: `900` seconds / 15 minutes
+- Pause after: `8` consecutive rate limits
+- Archive: enabled
+- Resume/history: preserved in `/config/app.db`
+
+Slow Safe Mode reduces rate-limit risk by running one download at a time and
+waiting longer between jobs. If SoundCloud still rate-limits the sync, the app
+marks the job `Paused - Rate Limited` and stops safely instead of sleeping for
+hours or days. Resume uses both `/config/archive.txt` and `/config/app.db`, so
+already downloaded tracks are skipped when you start again later.
+
+Turning on Slow Safe Mode in the UI applies it to the next job only. Click
+`Save Slow Safe Mode as default` if you want these conservative values written
+to `/config/settings.json`.
+
 ### Recommended Settings for 20k+ Likes
 
 - `MAX_CONCURRENT_DOWNLOADS=1`

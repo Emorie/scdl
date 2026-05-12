@@ -59,6 +59,18 @@
               </label>
             </div>
 
+            <div class="slow-safe-card">
+              <label class="slow-safe-toggle">
+                <input id="slow-safe-mode" class="job-slow-safe-toggle" type="checkbox" />
+                <span>
+                  <strong>Slow Safe Mode</strong>
+                  <small>Recommended for huge likes/profile syncs. Runs one at a time with a longer delay and pauses safely on rate limits.</small>
+                </span>
+              </label>
+              <span id="slow-safe-badge" class="pill neutral">Normal mode</span>
+              <div id="slow-safe-effective" class="effective-settings"></div>
+            </div>
+
             <div class="action-row">
               <button id="check-button" class="secondary-button" type="button">Check Qualities</button>
               <button id="add-button" class="secondary-button" type="button">Add to Queue</button>
@@ -115,6 +127,11 @@
               <button id="likes-retry-failed" class="secondary-button" type="button">Retry Failed Only</button>
               <button id="stop-after-current" class="danger-button" type="button">Stop After Current Track</button>
             </div>
+            <label class="inline-chip">
+              <input id="likes-slow-safe-mode" class="job-slow-safe-toggle" type="checkbox" />
+              <span>Slow Safe Mode</span>
+              <span id="likes-slow-safe-badge" class="pill neutral">Normal mode</span>
+            </label>
             <div id="likes-current" class="mini-log empty-state">No Likes Sync running.</div>
             <h3 class="panel-subtitle">Recent Failures</h3>
             <div id="recent-failures" class="history-list empty-state">No recent failures.</div>
@@ -146,6 +163,11 @@
               </div>
             </div>
             <div class="queue-tools">
+              <label class="inline-chip queue-inline-chip">
+                <input id="queue-slow-safe-mode" class="job-slow-safe-toggle" type="checkbox" />
+                <span>Slow Safe Mode</span>
+                <span id="queue-slow-safe-badge" class="pill neutral">Normal mode</span>
+              </label>
               <button id="clear-completed" class="ghost-button" type="button">Clear Completed</button>
               <button id="clear-all" class="danger-button" type="button">Clear All</button>
             </div>
@@ -192,10 +214,12 @@
                 <select id="default-profile-type"></select>
               </label>
               <div class="toggle-list">
+                <label><input id="settings-slow-safe-default" type="checkbox" /> Use Slow Safe Mode by default</label>
                 <label><input id="archive-enabled" type="checkbox" /> Archive by default</label>
                 <label><input id="original-art" type="checkbox" /> Original artwork</label>
                 <label><input id="add-description" type="checkbox" /> Description text files</label>
               </div>
+              <button id="save-slow-safe-default" class="secondary-button" type="button">Save Slow Safe Mode as default</button>
             </div>
           </section>
 
