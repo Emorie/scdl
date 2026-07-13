@@ -1,7 +1,7 @@
 """scdl allows you to download music from Soundcloud
 
 Usage:
-    scdl (-l <track_url> | -s <search_query> | me) [-a | -f | -C | -t | -p | -r]
+    scdl (-l <track_url> | -s <search_query> | me [all]) [-a | -f | -C | -t | -p | -r]
     [-c | --force-metadata][-n <maxtracks>][-o <offset>][--hidewarnings][--debug | --error]
     [--path <path>][--addtofile][--addtimestamp][--onlymp3][--hide-progress][--min-size <size>]
     [--max-size <size>][--remove][--no-album-tag][--no-playlist-folder]
@@ -28,6 +28,8 @@ Options:
     -C                              Download all tracks commented on by a user
     -p                              Download all playlists of a user
     -r                              Download all reposts of user
+    all                            Download all likes with best-quality,
+                                    retries and archive defaults
     -c                              Continue if a downloaded file already exists
     --force-metadata                This will set metadata on already downloaded track
     -o [offset]                     Start downloading a playlist from the [offset]th track
@@ -100,9 +102,25 @@ import typing
 import urllib.parse
 import warnings
 from dataclasses import asdict
+
+if sys.platform == "win32":
+    import msvcrt
+
 from functools import lru_cache
 from types import TracebackType
-from typing import IO, Generator, List, NoReturn, Optional, Set, Tuple, Type, Union
+from typing import (
+    IO,
+    Any,
+    Generator,
+    List,
+    MutableMapping,
+    NoReturn,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 from tqdm import tqdm
 
@@ -160,8 +178,8 @@ def setup_requests_session(retries: int) -> None:
     adapter = HTTPAdapter(max_retries=strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    requests.get = session.get  # type: ignore[attr-defined]
-    requests.post = session.post  # type: ignore[attr-defined]
+    requests.get = session.get  # type: ignore[attr-defined,assignment]
+    requests.post = session.post  # type: ignore[attr-defined,assignment]
 
 
 class SCDLArgs(TypedDict):
@@ -198,6 +216,7 @@ class SCDLArgs(TypedDict):
     onlymp3: bool
     opus: bool
     best_quality: bool
+    all: bool
     list_qualities: bool
     original_art: bool
     original_metadata: bool
@@ -322,12 +341,30 @@ def get_filelock(path: Union[pathlib.Path, str], timeout: int = 10) -> SafeLock:
     return SafeLock(lock_path, timeout=timeout)
 
 
+def apply_all_command_defaults(arguments: MutableMapping[str, Any]) -> None:
+    """Apply `me all` preset defaults without overriding explicit user values."""
+    if not arguments.get("all"):
+        return
+
+    arguments["-f"] = True
+    arguments["--best-quality"] = True
+    arguments["-c"] = True
+
+    if not arguments.get("--retries"):
+        arguments["--retries"] = "3"
+
+    if not arguments.get("--download-archive"):
+        arguments["--download-archive"] = "archive.txt"
+
+
 def main() -> None:
     """Main function, parses the URL from command line arguments"""
     logger.addHandler(logging.StreamHandler())
 
     # Parse arguments
     arguments = docopt(__doc__, version=__version__)
+
+    apply_all_command_defaults(arguments)
 
     if arguments["--debug"]:
         logger.level = logging.DEBUG
@@ -872,8 +909,6 @@ def is_downloading_to_stdout(kwargs: SCDLArgs) -> bool:
 def get_stdout() -> Generator[IO, None, None]:
     # Credits: https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/utils/_utils.py#L575
     if sys.platform == "win32":
-        import msvcrt
-
         # stdout may be any IO stream, e.g. when using contextlib.redirect_stdout
         with contextlib.suppress(io.UnsupportedOperation):
             msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)

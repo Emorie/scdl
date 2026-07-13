@@ -1,7 +1,7 @@
 from base64 import b64encode
 from dataclasses import dataclass
 from functools import singledispatch
-from typing import Optional, Union
+from typing import Optional, Protocol, Union
 
 from mutagen import (
     FileType,
@@ -17,6 +17,10 @@ from mutagen import (
 )
 
 JPEG_MIME_TYPE: str = "image/jpeg"
+
+
+class ArtworkTagWriter(Protocol):
+    def __setitem__(self, key: str, value: object) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,21 @@ def _assemble_vorbis_tags(file: FileType, meta: MetadataInfo) -> None:
         file["description"] = meta.description
 
 
+def _assemble_vorbis_artwork_tags(file: ArtworkTagWriter, jpeg_data: bytes) -> None:
+    """Write artwork tags for OGG/Vorbis-based containers.
+
+    METADATA_BLOCK_PICTURE is the modern standard, while `coverart`/`coverartmime`
+    improve compatibility with players that still rely on legacy conventions.
+    """
+    pic = _get_flac_pic(jpeg_data).write()
+    pic_b64 = b64encode(pic).decode()
+    jpeg_b64 = b64encode(jpeg_data).decode()
+
+    file["metadata_block_picture"] = [pic_b64]
+    file["coverart"] = [jpeg_b64]
+    file["coverartmime"] = [JPEG_MIME_TYPE]
+
+
 @assemble_metadata.register(flac.FLAC)
 def _(file: flac.FLAC, meta: MetadataInfo) -> None:
     _assemble_vorbis_tags(file, meta)
@@ -104,8 +123,7 @@ def _(file: oggopus.OggOpus, meta: MetadataInfo) -> None:
     _assemble_vorbis_tags(file, meta)
 
     if meta.artwork_jpeg:
-        pic = _get_flac_pic(meta.artwork_jpeg).write()
-        file["metadata_block_picture"] = b64encode(pic).decode()
+        _assemble_vorbis_artwork_tags(file, meta.artwork_jpeg)
 
 
 @assemble_metadata.register(aiff.AIFF)

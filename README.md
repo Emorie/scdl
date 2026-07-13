@@ -38,6 +38,9 @@ scdl -l https://soundcloud.com/pandadub/sets/the-lost-ship --sync archive.txt
 
 # Download your likes (with authentification token)
 scdl me -f
+
+# Download all your likes with quality/retry/archive defaults
+scdl me all
 ```
 
 ## Options:
@@ -53,6 +56,8 @@ scdl me -f
 -C                              Download all tracks commented on by a user
 -p                              Download all playlists of a user
 -r                              Download all reposts of user
+all                             Download all likes with best-quality,
+                                retries and archive defaults
 -c                              Continue if a downloaded file already exists
 --force-metadata                This will set metadata on already downloaded track
 -o [offset]                     Start downloading a playlist from the [offset]th track (starting with 1)
