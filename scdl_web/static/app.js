@@ -8,6 +8,10 @@ const state = {
   urlInfo: null,
   urlInspectTimer: null,
   slowSafeMode: false,
+  expandedLogItems: new Set(JSON.parse(sessionStorage.getItem("scdl-expanded-log-items") || "[]")),
+  queueSignatures: new Map(),
+  liveFailures: 0,
+  pollingTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -328,8 +332,56 @@ function renderQueue(queue) {
     return;
   }
   list.className = "queue-list";
-  list.innerHTML = queue.items.map(renderQueueItem).join("");
+  const ids = new Set(queue.items.map((item) => item.id));
+  list.querySelectorAll(".queue-item[data-id]").forEach((node) => {
+    if (!ids.has(node.dataset.id)) node.remove();
+  });
+  // Keep the same DOM node for unchanged rows and move nodes for sorting. This
+  // preserves focus, expanded details, and the page scroll position.
+  for (const item of queue.items) {
+    patchQueueItem(list, item);
+    const row = list.querySelector(`.queue-item[data-id="${CSS.escape(item.id)}"]`);
+    if (row) list.appendChild(row);
+  }
   renderLikesCurrent(queue);
+}
+
+function queueItemSignature(item) {
+  return JSON.stringify({
+    status: item.status, target: item.target, summary: item.summary,
+    files: item.files, metadata: item.metadata_records, logs: item.logs,
+    retry: item.rate_limit_retry_at, error: item.last_error,
+  });
+}
+
+function persistExpandedLogItems() {
+  sessionStorage.setItem("scdl-expanded-log-items", JSON.stringify([...state.expandedLogItems]));
+}
+
+function patchQueueItem(list, item) {
+  const signature = queueItemSignature(item);
+  const selector = `.queue-item[data-id="${CSS.escape(item.id)}"]`;
+  const existing = list.querySelector(selector);
+  if (existing && state.queueSignatures.get(item.id) === signature) return;
+  const previousLog = existing?.querySelector(".log-view");
+  const scrollTop = previousLog?.scrollTop || 0;
+  const nearBottom = previousLog ? previousLog.scrollHeight - previousLog.scrollTop - previousLog.clientHeight < 28 : true;
+  const template = document.createElement("template");
+  template.innerHTML = renderQueueItem(item).trim();
+  const replacement = template.content.firstElementChild;
+  if (!replacement) return;
+  if (existing) existing.replaceWith(replacement); else list.appendChild(replacement);
+  state.queueSignatures.set(item.id, signature);
+  const details = replacement.querySelector("details[data-log-item]");
+  if (details) details.open = state.expandedLogItems.has(item.id);
+  const log = replacement.querySelector(".log-view");
+  if (log) {
+    if (nearBottom) log.scrollTop = log.scrollHeight;
+    else {
+      log.scrollTop = scrollTop;
+      replacement.querySelector(".new-logs-indicator")?.classList.remove("hidden");
+    }
+  }
 }
 
 function renderLikesCurrent(queue) {
@@ -397,9 +449,10 @@ function renderQueueItem(item) {
       ${rateLimitNote}
       <div class="summary-grid">${badges}${files}</div>
       ${metadata.title ? `<p class="metadata-line">${escapeHtml(metadata.artist || metadata.uploader || "Unknown Artist")} - ${escapeHtml(metadata.title)}</p>` : ""}
-      <details>
+      <details data-log-item="${escapeHtml(item.id)}">
         <summary>Logs and command</summary>
         <pre class="log-view">${escapeHtml(command + "\n\n" + (item.logs || []).join("\n"))}</pre>
+        <span class="new-logs-indicator hidden" role="status">New logs below</span>
         <button class="small-button copy-command" data-id="${escapeHtml(item.id)}" type="button">Copy Command</button>
         <button class="small-button copy-logs" data-id="${escapeHtml(item.id)}" type="button">Copy Logs</button>
       </details>
@@ -884,10 +937,38 @@ function wireEvents() {
       toast("Logs copied", "", "ok");
     }
   });
+  $("queue-list").addEventListener("toggle", (event) => {
+    const details = event.target.closest?.("details[data-log-item]");
+    if (!details) return;
+    if (details.open) state.expandedLogItems.add(details.dataset.logItem);
+    else state.expandedLogItems.delete(details.dataset.logItem);
+    persistExpandedLogItems();
+  }, true);
+  $("expand-logs").addEventListener("click", () => {
+    state.queue.items.forEach((item) => state.expandedLogItems.add(item.id));
+    persistExpandedLogItems();
+    renderQueue(state.queue);
+  });
+  $("collapse-logs").addEventListener("click", () => {
+    state.expandedLogItems.clear();
+    persistExpandedLogItems();
+    renderQueue(state.queue);
+  });
 }
 
 function connectEvents() {
+  if (window.scdlEventSource) window.scdlEventSource.close();
   const source = new EventSource("/api/events");
+  window.scdlEventSource = source;
+  const setLiveState = (label, kind) => {
+    $("live-state").textContent = label;
+    $("live-state").className = `pill ${kind}`;
+  };
+  source.onopen = () => {
+    state.liveFailures = 0;
+    setLiveState("Live", "ok");
+    if (state.pollingTimer) { clearInterval(state.pollingTimer); state.pollingTimer = null; }
+  };
   source.onmessage = (event) => {
     const data = JSON.parse(event.data);
     if (data.type === "snapshot") {
@@ -906,8 +987,15 @@ function connectEvents() {
     }
   };
   source.onerror = () => {
+    state.liveFailures += 1;
+    setLiveState(state.liveFailures >= 3 ? "Offline - polling" : "Reconnecting", "warn");
     $("queue-pill").textContent = "Live updates reconnecting";
     $("queue-pill").className = "pill warn";
+    if (state.liveFailures >= 3 && !state.pollingTimer) {
+      state.pollingTimer = setInterval(async () => {
+        try { renderQueue(await api("/api/queue")); setLiveState("Paused - polling", "neutral"); } catch { setLiveState("Offline", "bad"); }
+      }, 15000);
+    }
   };
 }
 
