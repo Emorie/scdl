@@ -45,6 +45,14 @@ class ReliableConfig:
     subprocess_timeout_seconds: int = 0
     subprocess_termination_grace_seconds: int = 15
     stall_confirmation_seconds: int = 30
+    min_api_request_interval_seconds: int = 5
+    max_api_request_interval_seconds: int = 12
+    skipped_remote_item_delay_seconds: int = 20
+    skipped_remote_item_delay_jitter_percent: int = 20
+    consecutive_remote_skip_limit: int = 25
+    remote_skip_break_seconds: int = 180
+    max_immediate_attempts_per_item: int = 3
+    stuck_item_retry_delay_hours: int = 6
     likes_check_interval_minutes: int = 30
     min_free_space_gb: int = 20
     smoke_test_batch_size: int = 0
@@ -69,6 +77,7 @@ class ReliableConfig:
             connect_timeout_seconds=integer("SCDL_CONNECT_TIMEOUT_SECONDS", 30), read_timeout_seconds=integer("SCDL_READ_TIMEOUT_SECONDS", 300), ffmpeg_timeout_seconds=integer("SCDL_FFMPEG_TIMEOUT_SECONDS", 1800),
             collection_page_timeout_seconds=integer("SCDL_COLLECTION_PAGE_TIMEOUT_SECONDS", 90), subprocess_timeout_seconds=integer("SCDL_SUBPROCESS_TIMEOUT_SECONDS", 0),
             subprocess_termination_grace_seconds=integer("SCDL_SUBPROCESS_TERMINATION_GRACE_SECONDS", 15), stall_confirmation_seconds=integer("SCDL_STALL_CONFIRMATION_SECONDS", 30),
+            min_api_request_interval_seconds=integer("SCDL_MIN_API_REQUEST_INTERVAL_SECONDS", 5), max_api_request_interval_seconds=integer("SCDL_MAX_API_REQUEST_INTERVAL_SECONDS", 12), skipped_remote_item_delay_seconds=integer("SCDL_SKIPPED_REMOTE_ITEM_DELAY_SECONDS", 20), skipped_remote_item_delay_jitter_percent=integer("SCDL_SKIPPED_REMOTE_ITEM_DELAY_JITTER_PERCENT", 20), consecutive_remote_skip_limit=integer("SCDL_CONSECUTIVE_REMOTE_SKIP_LIMIT", 25), remote_skip_break_seconds=integer("SCDL_REMOTE_SKIP_BREAK_SECONDS", 180), max_immediate_attempts_per_item=integer("SCDL_MAX_IMMEDIATE_ATTEMPTS_PER_ITEM", 3), stuck_item_retry_delay_hours=integer("SCDL_STUCK_ITEM_RETRY_DELAY_HOURS", 6),
             likes_check_interval_minutes=integer("SCDL_LIKES_CHECK_INTERVAL_MINUTES", 30), min_free_space_gb=integer("SCDL_MIN_FREE_SPACE_GB", 20),
             smoke_test_batch_size=integer("SCDL_SMOKE_TEST_BATCH_SIZE", 0), diagnostic_mode=truth("SCDL_DIAGNOSTIC_MODE"),
             diagnostic_log_max_mb=integer("SCDL_DIAGNOSTIC_LOG_MAX_MB", 100), diagnostic_log_backup_count=integer("SCDL_DIAGNOSTIC_LOG_BACKUP_COUNT", 10),
@@ -76,6 +85,7 @@ class ReliableConfig:
         if cfg.max_concurrent_downloads != 1: raise ValueError("SCDL_MAX_CONCURRENT_DOWNLOADS must be exactly 1 for reliable sync")
         if cfg.batch_size < 1 or cfg.min_track_delay_seconds < 0 or cfg.max_track_delay_seconds < cfg.min_track_delay_seconds: raise ValueError("invalid reliable-sync batch or delay settings")
         if cfg.hard_min_delay_seconds > cfg.min_track_delay_seconds: raise ValueError("SCDL_HARD_MIN_DELAY_SECONDS cannot exceed normal minimum")
+        if cfg.max_api_request_interval_seconds < cfg.min_api_request_interval_seconds or cfg.skipped_remote_item_delay_jitter_percent > 100: raise ValueError("invalid API pacing settings")
         if cfg.likes_check_interval_minutes < 5 or cfg.min_free_space_gb < 0 or cfg.diagnostic_log_max_mb < 1 or cfg.diagnostic_log_backup_count < 1: raise ValueError("invalid reliable-sync safety setting")
         if any(value <= 0 for value in (cfg.metadata_timeout_seconds, cfg.media_resolve_timeout_seconds, cfg.connect_timeout_seconds, cfg.read_timeout_seconds, cfg.ffmpeg_timeout_seconds, cfg.collection_page_timeout_seconds, cfg.subprocess_termination_grace_seconds, cfg.stall_confirmation_seconds)) or cfg.subprocess_timeout_seconds < 0: raise ValueError("timeouts must be positive (subprocess total may be zero to disable)")
         return cfg
@@ -185,6 +195,10 @@ class Store:
                 if r["status"] == "completed" and final and final.exists() and final.stat().st_size > 0: continue
                 status = "repair_needed" if r["status"] == "completed" else "retry_wait"
                 c.execute("UPDATE reliable_tracks SET status=?, next_retry_at=? WHERE track_id=?", (status, time.time(), r["track_id"]))
+    def completed_local(self, track_id: str) -> bool:
+        with self.connect() as c:
+            row = c.execute("SELECT final_path,file_size FROM reliable_tracks WHERE track_id=? AND status='completed'", (track_id,)).fetchone()
+        return bool(row and row["final_path"] and Path(row["final_path"]).is_file() and Path(row["final_path"]).stat().st_size == int(row["file_size"] or 0) and int(row["file_size"] or 0) > 0)
     def record_event(self, event: dict[str, Any]) -> None:
         payload = dict(event)
         with self.connect() as c:
@@ -239,6 +253,7 @@ class ReliableSync:
         self.diag, self.discover, self.command_for = Diagnostics(config_dir, cfg), discover, command_for
         self.task: asyncio.Task | None = None; self.stop_requested = asyncio.Event(); self.current: str | None = None; self.last_success: float | None = None
         self.process: asyncio.subprocess.Process | None = None
+        self.last_process_result = "none"
     async def start(self) -> None:
         self.store.init(); self.store.reconcile()
         if self.cfg.enabled and not self.task: self.task = asyncio.create_task(self.run(), name="reliable-scdl-sync")
@@ -266,23 +281,39 @@ class ReliableSync:
                 if self.store.state("manually_paused", False) or self.store.state("authentication_paused", False): await asyncio.sleep(30); continue
                 if self._low_space(): await asyncio.sleep(60); continue
                 if (until := self.store.state("global_cooldown_until")) and until > time.time(): await asyncio.sleep(min(60, until - time.time())); continue
+                if (until := self.store.state("remote_skip_break_until", 0)) and until > time.time(): await asyncio.sleep(min(60, until - time.time())); continue
                 if not self.store.eligible():
                     if not self.store.state("active_batch_id") and self.store.start_batch(self.cfg.smoke_test_batch_size or self.cfg.batch_size):
                         continue
                     await self._discover_if_due(); await asyncio.sleep(5); continue
                 await self._process(self.store.eligible())
-                await asyncio.sleep(self._delay())
+                if self.last_process_result == "downloaded": await asyncio.sleep(self._delay())
+                elif self.last_process_result == "remote_skip": await asyncio.sleep(self._remote_skip_delay())
             except asyncio.CancelledError: raise
             except Exception as exc: self._emit({"stage": "scheduler", "error_class": classify_error(exc)[0], "error": sanitize_error(exc)}); await asyncio.sleep(60)
     def _low_space(self) -> bool:
         return not self.download_dir.exists() or shutil.disk_usage(self.download_dir).free < self.cfg.min_free_space_gb * 1024**3
     def _delay(self) -> float: return max(self.cfg.hard_min_delay_seconds, random.uniform(self.cfg.min_track_delay_seconds, self.cfg.max_track_delay_seconds))
+    async def _govern(self, stage: str, track_id: str | None = None) -> None:
+        last = float(self.store.state("last_api_request_started_at", 0) or 0)
+        interval = random.uniform(self.cfg.min_api_request_interval_seconds, self.cfg.max_api_request_interval_seconds)
+        wait = max(0.0, last + interval - time.time())
+        if wait:
+            self._emit({"stage": stage, "track_id": track_id, "result": "waiting_for_api_pacing", "delay_applied_seconds": wait})
+            await asyncio.sleep(wait)
+        self.store.set_state("last_api_request_started_at", time.time())
+        self._emit({"stage": stage, "track_id": track_id, "result": "remote_request_started"})
+    def _remote_skip_delay(self) -> float:
+        base = self.cfg.skipped_remote_item_delay_seconds
+        jitter = base * self.cfg.skipped_remote_item_delay_jitter_percent / 100
+        return max(0.0, random.uniform(base - jitter, base + jitter))
     async def _discover_if_due(self) -> None:
         if not self.discover: return
         due = self.store.state("next_likes_check", 0)
         if due > time.time(): return
         cursor = self.store.state("likes_cursor")
         started = time.monotonic()
+        await self._govern("likes_pagination")
         try:
             tracks, cursor = await asyncio.wait_for(asyncio.to_thread(self.discover, cursor), timeout=self.cfg.collection_page_timeout_seconds)
         except asyncio.TimeoutError as exc:
@@ -295,10 +326,16 @@ class ReliableSync:
         self._emit({"stage": "likes_pagination", "batch_id": batch_id, "duration_seconds": time.monotonic()-started, "discovered": len(tracks), "inserted": inserted})
     async def _process(self, row: sqlite3.Row | None) -> None:
         if not row or not self.command_for: return
+        self.last_process_result = "none"
+        if self.store.completed_local(row["track_id"]):
+            self._emit({"stage": "local_verification", "track_id": row["track_id"], "result": "local_skip", "locally_known": True})
+            self.last_process_result = "local_skip"
+            return
         self.current = row["track_id"]; started = time.monotonic(); self.store.update(self.current, status="resolving", attempt_count=int(row["attempt_count"])+1)
         staging = self.download_dir / ".scdl-staging" / self.current; staging.mkdir(parents=True, exist_ok=True)
         self.store.update(self.current, status="downloading", temporary_path=str(staging))
         try:
+            await self._govern("track_resolution", self.current)
             built = self.command_for(row["permalink"], staging)
             command, final_dir = built if isinstance(built, tuple) else (built, self.download_dir)
             proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -313,11 +350,21 @@ class ReliableSync:
                 raise RuntimeError("subprocess total timeout")
             if proc.returncode: raise RuntimeError(sanitize_error(output.decode("utf-8", "replace")[-1000:]))
             files = [p for p in staging.rglob("*") if p.is_file() and p.suffix.lower() in {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"} and p.stat().st_size > 0]
-            if not files: raise RuntimeError("scdl exited successfully without a media file")
+            if not files:
+                skips = int(self.store.state("consecutive_remote_skips", 0) or 0) + 1
+                self.store.set_state("consecutive_remote_skips", skips)
+                if skips >= self.cfg.consecutive_remote_skip_limit:
+                    self.store.set_state("remote_skip_break_until", time.time() + self.cfg.remote_skip_break_seconds)
+                self.store.update(self.current, status="unavailable", verified_at=time.time(), error_summary="remote-assisted skip")
+                self._emit({"stage":"track_resolution", "track_id":self.current, "result":"remote_skip", "locally_known":False, "duration_seconds":time.monotonic()-started})
+                self.last_process_result = "remote_skip"
+                return
             source = files[0]; final_dir.mkdir(parents=True, exist_ok=True); final = final_dir / source.name
             self.store.update(self.current, status="processing"); os.replace(source, final)
             self.store.update(self.current, status="completed", final_path=str(final), temporary_path=None, file_size=final.stat().st_size, completed_at=time.time(), verified_at=time.time(), last_failure_stage=None, error_summary=None, next_retry_at=None)
             self.last_success = time.time(); self._emit({"stage":"completed", "track_id":self.current, "duration_seconds":time.monotonic()-started, "file_size":final.stat().st_size})
+            self.store.set_state("consecutive_remote_skips", 0)
+            self.last_process_result = "downloaded"
         except Exception as exc:
             stage, status, retryable = classify_error(exc); attempts = int(row["attempt_count"])+1
             if stage == "http_429":
@@ -326,6 +373,8 @@ class ReliableSync:
                 # A supported refresh is owned by the installed SoundCloud client.
                 # Do not repeatedly manufacture credentials or retry a bad session.
                 delay = 24 * 3600; self.store.set_state("authentication_paused", True)
+            elif attempts >= self.cfg.max_immediate_attempts_per_item:
+                delay = self.cfg.stuck_item_retry_delay_hours * 3600; retryable = True; stage = "stuck_item_deferred"
             else: delay = TRANSIENT_DELAYS[min(attempts-1, len(TRANSIENT_DELAYS)-1)] if retryable else 7*86400
             next_status = "retry_wait" if retryable or stage == "authentication" else "unavailable"
             self.store.update(self.current, status=next_status, last_http_status=status, last_failure_stage=stage, error_summary=sanitize_error(exc), next_retry_at=time.time()+delay)
