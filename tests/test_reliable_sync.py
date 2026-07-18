@@ -25,11 +25,11 @@ def test_completed_missing_file_is_repair_needed(tmp_path: Path) -> None:
 
 def test_one_hundred_completed_tracks_are_verified_locally_without_subprocess(tmp_path: Path) -> None:
     store = Store(tmp_path / "app.db"); store.init()
-    for number in range(100):
+    for number in range(1, 101):
         media = tmp_path / f"{number}.mp3"; media.write_bytes(b"media")
         store.insert_tracks([{ "id": number, "permalink_url": f"https://soundcloud.com/a/{number}" }])
         store.update(str(number), status="completed", final_path=str(media), file_size=media.stat().st_size)
-    assert all(store.completed_local(str(number)) for number in range(100))
+    assert all(store.completed_local(str(number)) for number in range(1, 101))
 
 
 def test_429_is_not_confused_with_plain_timeout() -> None:
