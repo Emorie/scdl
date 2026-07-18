@@ -2115,7 +2115,10 @@ class QueueManager:
                     item.rate_limit_count += 1
                     capped = min(max(backoff, 0), max_backoff)
                     item.last_rate_limit_backoff = capped
-                    item.rate_limit_retry_at = parse_rate_limit_reset(line) or (time.time() + capped if capped else None)
+                    # Plain subprocess output cannot prove a 429, but it is a
+                    # safety signal. Stop the monolithic worker rather than
+                    # allowing its own retry loop to keep issuing requests.
+                    item.rate_limit_retry_at = parse_rate_limit_reset(line) or (time.time() + capped if capped else time.time() + 3600)
                     if backoff > max_backoff:
                         line = f"Rate limited. Backoff capped at {max_backoff}s."
                         pause_due_to_cap = True
@@ -2123,7 +2126,8 @@ class QueueManager:
                     elif backoff > 0:
                         line = f"Rate limited. Backoff {capped}s."
                     else:
-                        line = "Rate limited."
+                        line = "Probable rate limit from downloader output. Pausing this collection safely."
+                        item.rate_limit_pause_requested = True
                     if item.rate_limit_count >= max_repeated:
                         pause_due_to_repeated = True
                         item.rate_limit_pause_requested = True
@@ -2175,6 +2179,11 @@ class QueueManager:
             item.command = command
             item.masked_command = masked
             item.archive_enabled = archive_enabled
+            if item.slow_safe_mode and item.url_kind == "playlist" and "--retries" in item.command:
+                retries_index = item.command.index("--retries") + 1
+                item.command[retries_index] = "0"
+                item.masked_command[retries_index] = "0"
+                item.logs.append("Slow Safe playlist mode disables scdl internal retries; persisted cooldown handling owns retries.")
             persist_item(item)
         except HTTPException as exc:
             item.return_code = 1
