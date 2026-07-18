@@ -117,6 +117,36 @@ scdl me -f
 This fork includes a NAS-friendly FastAPI web wrapper for `scdl`. It is a UI and
 queue around the existing CLI; it does not replace the downloader logic.
 
+### Reliable likes sync (opt-in)
+
+The normal web queue remains unchanged for one-off downloads.  For a large,
+authorised likes library, set `SCDL_RELIABLE_SYNC_ENABLED=true` only after a
+small smoke test.  The reliable worker stores per-track state in the existing
+`/config/app.db`, uses the SoundCloud track ID as its deduplication key, runs
+exactly one `scdl` process at a time, and waits 150--240 seconds after every
+attempt.  It disables `scdl`'s nested retries for this path so retries are
+persisted and individually classified instead.
+
+It writes optional redacted JSON Lines diagnostics to
+`/config/diagnostics/scdl-events.jsonl`, rotates them by size, honours a
+persisted 429 cooldown, and exposes `/api/reliable/queue` and
+`/api/reliable/failures`.  `/health` remains healthy while the worker is
+deliberately pacing, polling, waiting for disk space, or observing a cooldown.
+No account token, cookie, authorization header, or signed media URL is written
+to these diagnostics.
+
+Copy `.env.example` to your deployment configuration.  Start with
+`SCDL_SMOKE_TEST_BATCH_SIZE=10`, inspect `/health`, the SQLite database, and
+the diagnostics, then set the batch size to 500.  A 500-track batch at the
+default 195-second average pause has roughly 27.1 hours of intentional pauses;
+transfers, processing, retries, and server-requested cooldowns add time.
+
+To compare normal phone streaming safely, run two manually selected 10--20
+track batches with identical settings: first with no streaming, then with
+ordinary official-app streaming. Compare `/api/reliable/failures` and the
+diagnostic durations. A small comparison cannot establish causation; only a
+repeatable increase in the same failure type is evidence of correlation.
+
 Default web downloads run:
 
 ```bash

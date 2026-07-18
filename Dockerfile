@@ -1,4 +1,5 @@
 FROM python:3.12-slim
+ARG SCDL_VERSION=v2.12.4
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -25,6 +26,8 @@ COPY . /app
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements-web.txt \
     && pip install --no-cache-dir -e .
+
+RUN python -c "import scdl; assert scdl.__version__ == '${SCDL_VERSION}'"
 
 RUN python -c "import scdl_web.main; assert scdl_web.main.app"
 RUN chmod -R a+rX /app

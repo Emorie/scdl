@@ -15,14 +15,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scdl_web import APP_VERSION
+from scdl_web.reliable import ReliableConfig, ReliableSync
 
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config")).resolve()
@@ -2501,15 +2502,76 @@ class QueueManager:
 
 
 queue_manager = QueueManager()
+reliable_sync: ReliableSync | None = None
+
+
+def reliable_likes_page(cursor: Any) -> tuple[list[dict[str, Any]], Any]:
+    """Fetch one page only.  soundcloud-v2 API shapes vary, so keep this thin
+    adapter isolated and never retain a full likes collection in memory."""
+    token = get_auth_token()
+    if not token:
+        raise RuntimeError("authentication is required for reliable likes sync")
+    from soundcloud import SoundCloud
+
+    client = SoundCloud(None, token)
+    me = client.get_me()
+    if isinstance(cursor, str) and cursor.startswith(("http://", "https://")):
+        query = parse_qs(urlparse(cursor).query)
+        cursor = query.get("offset", [None])[0]
+    try:
+        offset = int(cursor or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("soundcloud-v2 returned a cursor that this installed client cannot resume safely") from exc
+    # Current soundcloud-v2 exposes get_user_likes; older releases expose
+    # get_likes on the user object.  Both calls request one bounded page.
+    if hasattr(client, "get_user_likes"):
+        page = client.get_user_likes(getattr(me, "id"), limit=200, offset=offset)
+    elif hasattr(me, "get_likes"):
+        page = me.get_likes(limit=200, offset=offset)
+    else:
+        raise RuntimeError("installed soundcloud-v2 does not expose paged likes")
+    values = getattr(page, "collection", page if isinstance(page, list) else [])
+    records: list[dict[str, Any]] = []
+    for like in values:
+        track = getattr(like, "track", None) or (like.get("track") if isinstance(like, dict) else like)
+        get = (lambda key: track.get(key)) if isinstance(track, dict) else (lambda key: getattr(track, key, None))
+        permalink = get("permalink_url")
+        if not get("id") or not permalink:
+            continue
+        user = get("user") or {}
+        artist = user.get("username") if isinstance(user, dict) else getattr(user, "username", None)
+        records.append({"id": get("id"), "permalink_url": permalink, "title": get("title"), "artist": artist, "liked_at": getattr(like, "created_at", None), "source_type": "likes"})
+    next_cursor = getattr(page, "next_href", None) or (offset + len(records) if records else None)
+    return records, next_cursor
+
+
+def reliable_command(url: str, staging_dir: Path) -> tuple[list[str], Path]:
+    """Use existing quality, naming, organisation and authentication settings.
+    Set scdl's own retry count to zero; the persistent scheduler owns retries."""
+    command, _, _ = build_scdl_args("best-original", url, archive_enabled=True)
+    path_index = command.index("--path") + 1
+    final_dir = Path(command[path_index])
+    command[path_index] = str(staging_dir)
+    retry_index = command.index("--retries") + 1
+    command[retry_index] = "0"
+    return command, final_dir
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global reliable_sync
     ensure_directories()
     init_db()
     load_settings()
     await queue_manager.load_from_db()
-    yield
+    cfg = ReliableConfig.from_env()
+    reliable_sync = ReliableSync(CONFIG_DIR, DOWNLOAD_DIR, cfg, reliable_likes_page, reliable_command)
+    await reliable_sync.start()
+    try:
+        yield
+    finally:
+        if reliable_sync:
+            await reliable_sync.stop()
 
 
 app = FastAPI(title="SoundCloud Quality Downloader", version=APP_VERSION, lifespan=lifespan)
@@ -2728,7 +2790,7 @@ async def get_history(
 
 @app.get("/api/stats")
 async def get_stats() -> dict[str, Any]:
-    return app_stats()
+    return {**app_stats(), "reliable_sync": reliable_sync.health() if reliable_sync else None}
 
 
 async def run_collect(command: list[str], masked_command: list[str], log_path: Path) -> tuple[int, str]:
@@ -2885,6 +2947,7 @@ def health_payload() -> dict[str, Any]:
         "history": {"ok": db_ok, "path": str(DB_PATH), "message": db_message},
         "logs": {"ok": LOG_DIR.exists() and logs_writable, "path": str(LOG_DIR), "message": logs_message},
         "python": sys.version.split()[0],
+        "reliable_sync": reliable_sync.health() if reliable_sync else {"enabled": False, "running": False},
     }
 
 
@@ -2894,8 +2957,46 @@ async def api_health() -> dict[str, Any]:
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
-    return health_payload()
+async def health() -> JSONResponse:
+    payload = health_payload()
+    # Intentional pacing, persisted cooldowns, next-poll waits, and low-space
+    # pauses are operational states, not liveness failures.  A database failure
+    # or a missing executable is actionable and should fail Docker healthcheck.
+    critical_ok = payload["history"]["ok"] and payload["scdl"]["ok"] and payload["ffmpeg"]["ok"]
+    return JSONResponse(payload, status_code=200 if critical_ok else 503)
+
+
+@app.get("/api/reliable/queue")
+async def reliable_queue() -> dict[str, Any]:
+    if not reliable_sync:
+        raise HTTPException(status_code=503, detail="Reliable sync has not initialized")
+    return reliable_sync.health()
+
+
+@app.get("/api/reliable/failures")
+async def reliable_failures() -> dict[str, Any]:
+    if not reliable_sync:
+        raise HTTPException(status_code=503, detail="Reliable sync has not initialized")
+    return {"groups": reliable_sync.store.failure_summary(), "note": "Correlation requires repeated comparable observations; a single phone-streaming comparison cannot prove cause."}
+
+
+@app.post("/api/reliable/pause")
+async def reliable_pause() -> dict[str, Any]:
+    if not reliable_sync:
+        raise HTTPException(status_code=503, detail="Reliable sync has not initialized")
+    reliable_sync.store.set_state("manually_paused", True)
+    return reliable_sync.health()
+
+
+@app.post("/api/reliable/resume")
+async def reliable_resume() -> dict[str, Any]:
+    if not reliable_sync:
+        raise HTTPException(status_code=503, detail="Reliable sync has not initialized")
+    reliable_sync.store.set_state("manually_paused", False)
+    # A human may resume after correcting a token; this does not refresh,
+    # replace, or otherwise manipulate account credentials.
+    reliable_sync.store.set_state("authentication_paused", False)
+    return reliable_sync.health()
 
 
 @app.get("/api/events")
