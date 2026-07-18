@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,15 @@ def test_completed_missing_file_is_repair_needed(tmp_path: Path) -> None:
     assert store.counts() == {"repair_needed": 1}
 
 
+def test_one_hundred_completed_tracks_are_verified_locally_without_subprocess(tmp_path: Path) -> None:
+    store = Store(tmp_path / "app.db"); store.init()
+    for number in range(1, 101):
+        media = tmp_path / f"{number}.mp3"; media.write_bytes(b"media")
+        store.insert_tracks([{ "id": number, "permalink_url": f"https://soundcloud.com/a/{number}" }])
+        store.update(str(number), status="completed", final_path=str(media), file_size=media.stat().st_size)
+    assert all(store.completed_local(str(number)) for number in range(1, 101))
+
+
 def test_429_is_not_confused_with_plain_timeout() -> None:
     assert classify_error("HTTP 429 Too Many Requests") == ("http_429", 429, True)
     assert classify_error("read timeout") == ("read_timeout", None, True)
@@ -32,6 +42,21 @@ def test_invalid_concurrency_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("SCDL_MAX_CONCURRENT_DOWNLOADS", "2")
     with pytest.raises(ValueError, match="exactly 1"):
         ReliableConfig.from_env()
+
+
+def test_collection_page_timeout_preserves_cursor(tmp_path: Path) -> None:
+    def slow_discovery(cursor: object) -> tuple[list[dict[str, object]], object]:
+        time.sleep(0.05)
+        return [], cursor
+    cfg = ReliableConfig(collection_page_timeout_seconds=1, min_free_space_gb=0)
+    sync = ReliableSync(tmp_path, tmp_path, cfg, discover=slow_discovery)
+    sync.store.init(); sync.store.set_state("likes_cursor", 42)
+    # A very small value is set directly to exercise the timeout path without
+    # adding an invalid production configuration value.
+    object.__setattr__(sync.cfg, "collection_page_timeout_seconds", 0.001)
+    with pytest.raises(RuntimeError, match="collection page timeout"):
+        asyncio.run(sync._discover_if_due())
+    assert sync.store.state("likes_cursor") == 42
 
 
 def test_batch_claims_no_more_than_configured_limit(tmp_path: Path) -> None:

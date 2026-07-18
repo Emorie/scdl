@@ -565,6 +565,15 @@ button,
   white-space: pre-wrap;
 }
 
+.new-logs-indicator {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--amber);
+  font-size: 0.82rem;
+}
+
+.hidden { display: none !important; }
+
 .queue-list {
   display: grid;
   gap: 12px;

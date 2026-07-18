@@ -155,6 +155,23 @@ FFMPEG_PIPE_CHUNK_SIZE = 1024 * 1024  # 1 mb
 files_to_keep = []
 
 
+def request_timeout(operation: str = "metadata") -> Tuple[int, int]:
+    """Return explicit connect/read-inactivity timeouts for direct requests.
+
+    ``requests`` applies the read timeout to each socket read, so an active
+    audio transfer is allowed to run indefinitely while a stalled transfer is
+    bounded.  SoundCloud-client calls remain owned by soundcloud-v2.
+    """
+    connect = int(os.environ.get("SCDL_CONNECT_TIMEOUT_SECONDS", "30"))
+    if operation == "media_resolution":
+        read = int(os.environ.get("SCDL_MEDIA_RESOLVE_TIMEOUT_SECONDS", "90"))
+    elif operation == "audio":
+        read = int(os.environ.get("SCDL_READ_TIMEOUT_SECONDS", "300"))
+    else:
+        read = int(os.environ.get("SCDL_METADATA_TIMEOUT_SECONDS", "60"))
+    return max(1, connect), max(1, read)
+
+
 def setup_requests_session(retries: int) -> None:
     """Configure global requests session with retry logic."""
     session = requests.Session()
@@ -521,7 +538,7 @@ def validate_url(client: SoundCloud, url: str) -> str:
 
     # see if link redirects to soundcloud.com
     try:
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=request_timeout())
         if url.startswith(("https://soundcloud.com", "http://soundcloud.com")):
             return urllib.parse.urljoin(resp.url, urllib.parse.urlparse(resp.url).path)
     except Exception:
@@ -946,7 +963,7 @@ def download_original_file(
         logger.info("Could not get original download link")
         return None, False
 
-    r = requests.get(url, stream=True)
+    r = requests.get(url, stream=True, timeout=request_timeout("audio"))
     content_type = r.headers.get("content-type", "?")
     content_len = r.headers.get("content-length")
     if content_len is not None:
@@ -1049,7 +1066,7 @@ def get_transcoding_m3u8(
                 logger.warning(f"Got rate-limited, delaying for {delay}sec")
                 time.sleep(delay)
 
-            r = requests.get(url, headers=headers, params=params)
+            r = requests.get(url, headers=headers, params=params, timeout=request_timeout("media_resolution"))
             delay = (delay or 1) * 2  # exponential backoff, what could possibly go wrong
 
         if r.status_code != 200:
@@ -1365,7 +1382,7 @@ def _try_get_artwork(url: str, size: str = "original") -> Optional[requests.Resp
     new_artwork_url = url.replace("large", size)
 
     try:
-        artwork_response = requests.get(new_artwork_url, allow_redirects=False, timeout=5)
+        artwork_response = requests.get(new_artwork_url, allow_redirects=False, timeout=request_timeout())
 
         if artwork_response.status_code != 200:
             return None

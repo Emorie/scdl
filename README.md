@@ -117,6 +117,13 @@ scdl me -f
 This fork includes a NAS-friendly FastAPI web wrapper for `scdl`. It is a UI and
 queue around the existing CLI; it does not replace the downloader logic.
 
+### Web service version
+
+The running web-service version is shown in the dashboard Health card and at
+`/health` (`app.version`). Every published web-service change increments
+`scdl_web.APP_VERSION` using semantic versioning, so after an update you can
+verify the deployed NAS image without guessing from build timestamps.
+
 ### Reliable likes sync (opt-in)
 
 The normal web queue remains unchanged for one-off downloads.  For a large,
