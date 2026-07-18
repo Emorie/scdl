@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,21 @@ def test_invalid_concurrency_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("SCDL_MAX_CONCURRENT_DOWNLOADS", "2")
     with pytest.raises(ValueError, match="exactly 1"):
         ReliableConfig.from_env()
+
+
+def test_collection_page_timeout_preserves_cursor(tmp_path: Path) -> None:
+    def slow_discovery(cursor: object) -> tuple[list[dict[str, object]], object]:
+        time.sleep(0.05)
+        return [], cursor
+    cfg = ReliableConfig(collection_page_timeout_seconds=1, min_free_space_gb=0)
+    sync = ReliableSync(tmp_path, tmp_path, cfg, discover=slow_discovery)
+    sync.store.init(); sync.store.set_state("likes_cursor", 42)
+    # A very small value is set directly to exercise the timeout path without
+    # adding an invalid production configuration value.
+    object.__setattr__(sync.cfg, "collection_page_timeout_seconds", 0.001)
+    with pytest.raises(RuntimeError, match="collection page timeout"):
+        asyncio.run(sync._discover_if_due())
+    assert sync.store.state("likes_cursor") == 42
 
 
 def test_batch_claims_no_more_than_configured_limit(tmp_path: Path) -> None:

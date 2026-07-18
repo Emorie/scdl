@@ -41,6 +41,10 @@ class ReliableConfig:
     connect_timeout_seconds: int = 30
     read_timeout_seconds: int = 300
     ffmpeg_timeout_seconds: int = 1800
+    collection_page_timeout_seconds: int = 90
+    subprocess_timeout_seconds: int = 0
+    subprocess_termination_grace_seconds: int = 15
+    stall_confirmation_seconds: int = 30
     likes_check_interval_minutes: int = 30
     min_free_space_gb: int = 20
     smoke_test_batch_size: int = 0
@@ -63,6 +67,8 @@ class ReliableConfig:
             target_batch_min_hours=integer("SCDL_TARGET_BATCH_MIN_HOURS", 24), target_batch_max_hours=integer("SCDL_TARGET_BATCH_MAX_HOURS", 36),
             metadata_timeout_seconds=integer("SCDL_METADATA_TIMEOUT_SECONDS", 60), media_resolve_timeout_seconds=integer("SCDL_MEDIA_RESOLVE_TIMEOUT_SECONDS", 90),
             connect_timeout_seconds=integer("SCDL_CONNECT_TIMEOUT_SECONDS", 30), read_timeout_seconds=integer("SCDL_READ_TIMEOUT_SECONDS", 300), ffmpeg_timeout_seconds=integer("SCDL_FFMPEG_TIMEOUT_SECONDS", 1800),
+            collection_page_timeout_seconds=integer("SCDL_COLLECTION_PAGE_TIMEOUT_SECONDS", 90), subprocess_timeout_seconds=integer("SCDL_SUBPROCESS_TIMEOUT_SECONDS", 0),
+            subprocess_termination_grace_seconds=integer("SCDL_SUBPROCESS_TERMINATION_GRACE_SECONDS", 15), stall_confirmation_seconds=integer("SCDL_STALL_CONFIRMATION_SECONDS", 30),
             likes_check_interval_minutes=integer("SCDL_LIKES_CHECK_INTERVAL_MINUTES", 30), min_free_space_gb=integer("SCDL_MIN_FREE_SPACE_GB", 20),
             smoke_test_batch_size=integer("SCDL_SMOKE_TEST_BATCH_SIZE", 0), diagnostic_mode=truth("SCDL_DIAGNOSTIC_MODE"),
             diagnostic_log_max_mb=integer("SCDL_DIAGNOSTIC_LOG_MAX_MB", 100), diagnostic_log_backup_count=integer("SCDL_DIAGNOSTIC_LOG_BACKUP_COUNT", 10),
@@ -71,7 +77,7 @@ class ReliableConfig:
         if cfg.batch_size < 1 or cfg.min_track_delay_seconds < 0 or cfg.max_track_delay_seconds < cfg.min_track_delay_seconds: raise ValueError("invalid reliable-sync batch or delay settings")
         if cfg.hard_min_delay_seconds > cfg.min_track_delay_seconds: raise ValueError("SCDL_HARD_MIN_DELAY_SECONDS cannot exceed normal minimum")
         if cfg.likes_check_interval_minutes < 5 or cfg.min_free_space_gb < 0 or cfg.diagnostic_log_max_mb < 1 or cfg.diagnostic_log_backup_count < 1: raise ValueError("invalid reliable-sync safety setting")
-        if any(value <= 0 for value in (cfg.metadata_timeout_seconds, cfg.media_resolve_timeout_seconds, cfg.connect_timeout_seconds, cfg.read_timeout_seconds, cfg.ffmpeg_timeout_seconds)): raise ValueError("timeouts must be positive")
+        if any(value <= 0 for value in (cfg.metadata_timeout_seconds, cfg.media_resolve_timeout_seconds, cfg.connect_timeout_seconds, cfg.read_timeout_seconds, cfg.ffmpeg_timeout_seconds, cfg.collection_page_timeout_seconds, cfg.subprocess_termination_grace_seconds, cfg.stall_confirmation_seconds)) or cfg.subprocess_timeout_seconds < 0: raise ValueError("timeouts must be positive (subprocess total may be zero to disable)")
         return cfg
 
 
@@ -244,7 +250,7 @@ class ReliableSync:
         self.stop_requested.set()
         if self.process and self.process.returncode is None:
             self.process.terminate()
-            try: await asyncio.wait_for(self.process.wait(), timeout=20)
+            try: await asyncio.wait_for(self.process.wait(), timeout=self.cfg.subprocess_termination_grace_seconds)
             except asyncio.TimeoutError: self.process.kill(); await self.process.wait()
         if self.task: self.task.cancel()
         if self.task:
@@ -277,7 +283,11 @@ class ReliableSync:
         if due > time.time(): return
         cursor = self.store.state("likes_cursor")
         started = time.monotonic()
-        tracks, cursor = await asyncio.to_thread(self.discover, cursor)
+        try:
+            tracks, cursor = await asyncio.wait_for(asyncio.to_thread(self.discover, cursor), timeout=self.cfg.collection_page_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            self._emit({"stage": "likes_pagination", "error_class": "collection_page_timeout", "error": "collection page timed out", "duration_seconds": time.monotonic() - started})
+            raise RuntimeError("collection page timeout") from exc
         effective_size = self.cfg.smoke_test_batch_size or self.cfg.batch_size
         inserted = self.store.insert_tracks(tracks)
         batch_id = self.store.start_batch(effective_size)
@@ -293,8 +303,14 @@ class ReliableSync:
             command, final_dir = built if isinstance(built, tuple) else (built, self.download_dir)
             proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             self.process = proc
-            try: output, _ = await asyncio.wait_for(proc.communicate(), timeout=self.cfg.ffmpeg_timeout_seconds)
-            except asyncio.TimeoutError: proc.terminate(); await proc.wait(); raise RuntimeError("subprocess timeout")
+            try:
+                communication = proc.communicate()
+                output, _ = await (asyncio.wait_for(communication, timeout=self.cfg.subprocess_timeout_seconds) if self.cfg.subprocess_timeout_seconds else communication)
+            except asyncio.TimeoutError:
+                proc.terminate()
+                try: await asyncio.wait_for(proc.wait(), timeout=self.cfg.subprocess_termination_grace_seconds)
+                except asyncio.TimeoutError: proc.kill(); await proc.wait()
+                raise RuntimeError("subprocess total timeout")
             if proc.returncode: raise RuntimeError(sanitize_error(output.decode("utf-8", "replace")[-1000:]))
             files = [p for p in staging.rglob("*") if p.is_file() and p.suffix.lower() in {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"} and p.stat().st_size > 0]
             if not files: raise RuntimeError("scdl exited successfully without a media file")
